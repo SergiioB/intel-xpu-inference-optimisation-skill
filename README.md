@@ -25,6 +25,7 @@ skills/intel-xpu-inference-optimisation/
 ├── SKILL.md                                                # Agent skill entry point
 ├── PROMPT.md                                               # Copy of standalone prompt
 ├── references/
+│   ├── workflow-and-intake.md                              # Start here: 5-phase Day-0 intake, tensor census, op decomposition, kernel iteration & shipping
 │   ├── ceilings.md                                         # Xe2 silicon datapaths (XMX FP16/INT8/INT4, 16B align), looped/MoE/SWA & P2P ceilings
 │   ├── quantization.md                                     # 6 quant axes, format showdown (NVFP4/EXL3/MLX/AutoRound/GGUF/IQ/FP8), drafter economics
 │   ├── kv-and-context.md                                   # K/V KL-divergence table (q8_0 vs q4_0 K cliff), 3.8x dense-vs-MoE KV, SWA mbt, 11-turn sag

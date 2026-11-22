@@ -1,0 +1,82 @@
+# End-to-End Research & New-Recipe Approach (Zero to Shipped on Intel XPU)
+
+How to approach a brand-new model release, an underperforming recipe, or an open optimization session on Intel Arc Pro B60/B70 (Battlemage Xe2) without wasting GPU hours.
+
+---
+
+## Phase 0 — Upstream Reconnaissance & Tensor Census (Zero GPU Time, ~5 min)
+
+Before downloading a single gigabyte, converting weights, or writing code:
+
+1. **Inspect the official model card, `config.json`, and raw tensor headers (`DNR-014`):**
+   - Check exact weight dtypes per layer (never infer from repo name — e.g. Inkling 2 Mini mixes NVFP4 in layers 0–19, MXFP8 in layers 20–23, BF16 dense/vision/lm_head).
+   - Check architecture levers in `config.json`: MoE vs dense, loop passes, Sliding Window Attention (SWA) vs full-attention ratio, `model_max_length`, K/V pre-storage clipping/normalization (predicts whether unit-scale FP8 KV is safe!), vision tower size (`model.visual.*`), and built-in speculator/drafter weights (`mtp_config`, `dspark`, `dflash`).
+   - Copy the **model card's recommended sampling** (`temperature`, `top_p`, `reasoning_effort`) — this is your mandatory public headline sampling.
+2. **Search upstream engines, PRs, and plugins first:**
+   - Check open PRs and plugin repos across `vllm`, `vllm-xpu-kernels`, `TensorFold`, `exl3xpu`, `llama.cpp`, and `Strata` (e.g. `mgaruccio/vllm-inkling2-xpu`, vLLM PR `#69186`, TensorFold PR `#3586`, llama.cpp `#31125`).
+   - Read `references/gotchas.md` (`DNR-001`..`DNR-042`) — never retry a closed class unless its **Revisit when** condition is met.
+3. **Run host preflight & price the Xe2 roofline:**
+   - Run `python3 scripts/b70_preflight.py`: pick a free **non-display** B70 (`is_display == False`); if forced onto a display-driving card, budget `desktop_vram_mib + 1 GiB` (typically `1.5–4.6 GiB` lost to KDE/GNOME!).
+   - Run `python3 scripts/b70_ceiling.py`: compute active bytes/tok, theoretical decode ceiling (`active_bytes / 521 GB/s`), KV bytes/tok (full-attn vs SWA), and prefill TFLOPS ceiling.
+
+---
+
+## Phase 1 — Establish One Clean Correctness Foothold (~15 min)
+
+1. **Pick the highest-fidelity native engine first** (`references/engines-and-topology.md` & `references/quantization.md`):
+   - Native NVFP4/MXFP8 safetensors -> `vLLM XPU` (preserve native weights before trying GPTQ/GGUF!).
+   - Dense 20B–32B fast interactive -> `TensorFold` (MLX 4-bit + DFlash2) or `exl3xpu` (EXL3 4bpw + fp8 KV for 245K+).
+   - MoE / broad GGUF -> `llama.cpp SYCL` (`>= 2026-10-29`, `q8_0/q8_0` KV) or `Strata` (16B-aligned packs).
+2. **Stand up ONE clean baseline with graph replay ON:**
+   - `vLLM XPU`: `-cc.mode=none -cc.cudagraph_mode=FULL_DECODE_ONLY`, `--no-enable-prefix-caching` on packed/speculative stacks, short `VLLM_RPC_BASE_PATH`, `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1`, `ZE_AFFINITY_MASK=<gpu>`.
+   - Verify: clean startup, exact KV pool tokens, 1 short real prompt (reasoning & tool parser working), and clean `SIGTERM` teardown restoring baseline VRAM (`32,615 MiB`) and clean `dmesg`.
+
+---
+
+## Phase 2 — Hypothesis-Driven Bottleneck Decomposition (Never Guess!)
+
+Compare your baseline decode & prefill rates against your Phase 0 roofline. If the gap is `> 15%`, decompose **where the milliseconds actually go** in strict ROI order:
+
+### Step 2.1 — Kill Trivial Host / Dtype / Launch Bugs First (Minutes, +20%–50% ROI)
+- Audit `lm_head`, norms, router ops, and logits processors for accidental FP32 weight casts or per-step CPU syncs.
+- Example: vLLM PR `#69186` fixed a 2-line FP32 `lm_head` cast -> **+42% decode, -30% J/tok, +1.22 GiB KV** before writing a single GPU kernel!
+
+### Step 2.2 — Sweep Scheduler, Memory & Power Knobs Next
+- **SWA context unlock:** Sweep `--max-num-batched-tokens` (`2048` for speed ladders, `1024`/`512` to cut SWA reservations 2x–3x; never `4096`/`8192`).
+- **Power cap regime:** Check `150 W` for MoE models (can beat `230 W`!) vs `180–230 W` for dense/looped models.
+- **Speculative decoding:** Measure target `step_ms`, draft `step_ms`, and mean accepted length `a` separately (`tok/s = a / step_ms`); sweep `k` and check greedy parity (`drafted == serial` vs altered hashes).
+
+### Step 2.3 — Unlock Missing Features by Diffing Against Upstream NVIDIA/Reference Code
+- If a plugin refuses `--kv-cache-dtype fp8` or Vision (`--language-model-only`), read the upstream NVIDIA implementation sitting next to it!
+- **Vision Tower port pattern:** Replace CUDA PTX inline asm and CUDA FA2/3/4 with vectorized PyTorch XPU ops + native `F.scaled_dot_product_attention(..., is_causal=False)` -> zero JIT stall, `29.3 ms` for 2 images across 23 BF16 ViT layers, verified vs CPU reference (`cos = 0.9994`)!
+- **FP8 KV enablement pattern:** View `uint8` storage as `torch.float8_e4m3fn` and verify Triton XPU load/store in a 2-second micro-test first!
+
+### Step 2.4 — Microbenchmark & Parity-Test Every Kernel Change in 5 Seconds BEFORE Full-Server Runs
+- Apply the **Impact Gate (`>= 10%` removable wall-time share)** before writing SYCL or Triton code.
+- Write a **5-second standalone op microbenchmark** on the exact hot shape (`M=8` verify, `M=2048` prefill @ 64K/128K):
+  - This caught the **5.4x–11x Triton XPU 1-byte FP8 `tl.make_tensor_descriptor` slowdown** (`256.6 ms` vs `46.8 ms` BF16 @ 64K; `~510 ms` @ 128K) in 5 seconds instead of guessing!
+  - And it proved the **Chunked-LSE 256 MiB reusable BF16 scratch fix** (`46.4 ms` @ 128K = **11x faster**, `lse_max_err = 5.7e-6`, zero PyTorch XPU caching-allocator fragmentation)!
+- Always verify **exact numerical parity** (exhaustive bit patterns, `rel_l2 <= 5e-5` vs FP32/CPU oracle) before touching the live server.
+- Always **break `uv` hardlinks** before patching site-packages, and **gate custom kernels behind an opt-in env flag** (default `0` = stock).
+
+---
+
+## Phase 3 — Full Qualification Across the Entire Context Window
+
+Never stop at a short smoke or a raw KV-pool printout:
+
+1. **Speed ladder (model-card sampling, `n >= 3` seeds, zero prefix cache):** Measure `0, 8K, 32K, 64K, 128K, max` with unique entropy-first prompts (`prefix_cache_hits_total == 0.0`). Count both `delta.reasoning` and `delta.content`. Keep greedy (`temp=0`) strictly as a separate diagnostic table.
+2. **Separate capacity probes:** Keep lower-`mbt` max-context configs (`mbt=1024/512`) in their own capacity table, proven with real completed prompts.
+3. **Quality, Perplexity & Retrieval Gates:**
+   - Deterministic task suite (`8+` checks including `"14" not "30"`, JSON, code trace, multi-turn correction).
+   - **For quantized/FP8 KV:** Measure **matched BF16 vs FP8 held-out natural-prose perplexity** (`4K -> max_ctx` via `/v1/completions` `echo=True, logprobs=1`) + **`15%` oldest / `55%` mid dual-needle exact recall** up to max context (use `max_tokens >= 384` on thinking models so reasoning never starves `content`!).
+   - **For Vision:** Live real-image OCR (e.g. reading numbers off a chart PNG), synthetic visual counting, multi-image comparison, and pure-text regression check.
+4. **Hardware Cleanliness Proof:** Verify zero stray processes (`ps` filtered via `awk`, never `pkill -f` matching your own shell!), `vram_mm` restored to baseline, unchanged power caps, and clean `dmesg`.
+
+---
+
+## Phase 4 — Packaging, Visuals & Release Checklist
+
+1. **Cookbook:** Sanitize all private paths/PCI IDs, commit raw JSON evidence & patches first, pin commit SHA in `data/benchmarks.v1.json` (`benchmark` vs `capability`), regenerate catalog & site feeds, pass all 12 `scripts/check-repo.py` gates, merge with `--merge`.
+2. **Launcher & Portal (`b70-launcher` + `xecores.com`):** Add clean `ctx`/`ctx_safe`/`ctx_max`, `kv_options`, `vision` toggle, display-GPU VRAM adaptation, unit tests, deterministic tarball verification (`packaging/release.py --verify`), and live `post-deploy-check.mjs` (7/7 PASS).
+3. **Charts & Communication:** Render 2x anti-aliased PNGs, visually inspect every PNG with `read` for zero overlap/clipping, state exact scope and honest limits, draft human no-slop posts (never auto-post), and fold every new discovery back into `SESSIONS.md` and this skill!

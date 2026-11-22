@@ -25,6 +25,7 @@ preflight & DNR check -> roofline ceiling -> baseline -> pick highest (gap x lik
 ```
 
 Read only the reference file needed for the current step:
+- `references/workflow-and-intake.md` — **Start here for a new model or open optimization session:** full 5-phase approach from Day-0 upstream/tensor reconnaissance -> roofline -> baseline & 5-second op decomposition -> opt-in kernel/feature iteration -> 512K quality gates -> shipping.
 - `references/ceilings.md` — Intel Xe2 silicon datapaths (`FP16/BF16`, `INT8 s8xs8 367 TOPS`, `INT4 ESIMD`, `DP4A`, 16B alignment), looped/MoE active-byte math, SWA `mbt` KV formula, and speculative ceilings.
 - `references/quantization.md` — Complete Intel Xe2 quantization & drafter economics guide (6 independent quant axes, Native NVFP4/MXFP8 vs EXL3 vs MLX affine vs AutoRound/GPTQ vs GGUF/IQ vs FP8 vs OV NNCF, `"14"->"30"` W4A16 trap, hybrid-GDN PPL bug `#28879`, drafter × quant matching).
 - `references/kv-and-context.md` — KV cache K/V asymmetry & KL-divergence table (`q8_0/q8_0` vs `q8_0/q4_1` vs catastrophic `q4_0` K `KLD~5.5`), `#31125` 64K flash-attn speedup, dense vs MoE 3.8x KV scaling, vLLM SWA `mbt` tuning, FP8 E4M3 KV 512K Chunked-LSE (`+0.07%` PPL @ 245K, `3.58` @ 496K, 2/2 496K recall), and 11-turn session stability.
