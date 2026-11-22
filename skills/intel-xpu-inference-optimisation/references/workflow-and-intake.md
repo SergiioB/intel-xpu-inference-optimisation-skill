@@ -4,6 +4,24 @@ How to approach a brand-new model release, an underperforming recipe, or an open
 
 ---
 
+## Engineering Mindset & Attitude (What Actually Drives Breakthroughs)
+
+The tools and rooflines only work when paired with the right problem-solving attitude:
+
+1. **Stay positive, curious, and stubbornly constructive — treat every "NotImplementedError" or slowdown as a clue, never a dead end.**
+   - When a plugin says `"XPU requires --language-model-only"` or rejects `--kv-cache-dtype fp8`, inspect the checkpoint and upstream reference before accepting "unsupported." On Inkling 2 Mini, the entire 23-layer vision tower was blocked by a single PTX inline-asm line + CUDA FA (`651` lines -> ported to pure PyTorch XPU SDPA in `29.3 ms`), and FP8 KV was already supported by the underlying Triton kernels!
+   - When an optimization hits a wall (`5.4x` slower FP8 prefill, then `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` at `64K`), stay calm and excited to find the *why* — isolating the exact root cause (1-byte Triton tensor descriptor + PyTorch XPU caching-allocator fragmentation) turned a failure into an **11x Chunked-LSE breakthrough** (`905 tok/s` at `496K`).
+2. **Zero ego — celebrate a fast kill or clean revert just as much as a speedup.**
+   - Welcome hard external questions (*"does FP8 noise degrade perplexity at 512K?"*) by running the cleanest direct measurement (`4K -> 496K` held-out PPL + dual-needle recall) rather than arguing from intuition.
+   - Study other engineers' work (e.g. `Danmoreng/intel-b70-inkling2-mini-vllm`) with genuine respect — never dismiss it or panic-switch; decouple the artifact from the runtime tricks, keep what beats it, and test what might improve yours.
+   - When a promising idea fails live graph-replay verification (Triton Split-KV `80/128` looked `3x` faster in isolation but regressed `-10–12%` end-to-end) or fails the 10% Impact Gate (`M=4` vs `M=8` CUTLASS NVFP4 was only `2.58 ms` = `<6%`), **revert cleanly with zero attachment** and document the lesson so nobody pays that cost twice.
+3. **Think in bytes, milliseconds, and 5-second probes — never fly blind.**
+   - Always ask: *"Where do the milliseconds actually live?"* and *"What is the cheapest 5-second experiment that proves or kills this hypothesis?"* before writing 500 lines of code.
+   - Trust receipts over assumptions: check live `vram_mm`, `dmesg`, exact token counts, numerical parity oracles, and visually inspect every generated chart or UI screenshot.
+   - Maintain joyful, steady momentum by shipping small, opt-in, tested increments continuously rather than giant risky rewrites.
+
+---
+
 ## Phase 0 — Upstream Reconnaissance & Tensor Census (Zero GPU Time, ~5 min)
 
 Before downloading a single gigabyte, converting weights, or writing code:
