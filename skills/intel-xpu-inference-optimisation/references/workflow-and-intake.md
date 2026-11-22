@@ -19,6 +19,20 @@ Before downloading a single gigabyte, converting weights, or writing code:
    - Run `python3 scripts/b70_preflight.py`: pick a free **non-display** B70 (`is_display == False`); if forced onto a display-driving card, budget `desktop_vram_mib + 1 GiB` (typically `1.5–4.6 GiB` lost to KDE/GNOME!).
    - Run `python3 scripts/b70_ceiling.py`: compute active bytes/tok, theoretical decode ceiling (`active_bytes / 521 GB/s`), KV bytes/tok (full-attn vs SWA), and prefill TFLOPS ceiling.
 
+### Phase 0.5 — Auditing External Community Repos & Third-Party Quants (Zero GPU Time)
+
+When another engineer publishes an impressive B70 repo or alternate quant (e.g., `Danmoreng/intel-b70-inkling2-mini-vllm` using `EXL3-4bpw` + `trellis-serve` vs our native `NVFP4/MXFP8` `vllm-inkling2-xpu`), **never blindly switch stacks or dismiss the work.** Follow this 5-step decomposition first:
+
+1. **Read primary files & raw JSON before touching the GPU:** Inspect `README.md`, `benchmarks/**/*.md`, `target-parity.json`, `patches/`, and kernel `csrc/` directly via `gh api`. Never import external rates as your own reproduction (`B70-DOCS §19`).
+2. **Normalize every metric class & coordinate:** Separate power cap (`180 W` vs `230 W`), sampling (`top_p=0.95/top_k=20` vs `top_p=1.0`), reasoning budget, `mbt`, engine vs client tok/s, and synthetic vs real agent sessions.
+3. **Decouple the *artifact/quant* from the *kernel/scheduler mechanisms*:**
+   - Ask: *"Are their speedups coming from the third-party quant (`EXL3-4bpw`), or from orthogonal runtime wins we can apply directly to our official native checkpoint?"*
+   - Example (`Danmoreng` vs our native Inkling 2 Mini):
+     - **Keep our native `NVFP4/MXFP8` artifact** when you want zero double-quantization (EXL3 requantizes official weights with `KL ~0.0052` on 96-tok parity), `+42%` faster short/mid prefill (`3,920` vs `2,753 tok/s`), `512K` (`569K` KV) ceiling, and minimal upstream vLLM 0.34 diff.
+     - **Cherry-pick their 4 orthogonal runtime mechanisms** onto our native route: (a) **Adaptive DSpark** (`0.75` confidence early-stop up to `k=7`), (b) **Dedicated fixed-size SWA ring** (decouples SWA VRAM from `mbt=4096/6144`), (c) **128-partition SYCL FP8 decode attention** (`65–77 tok/s` @ `196K–232K` vs Triton FP8 `43.6 tok/s` @ `128K`), and (d) **Hybrid oneDNN prefix SDPA** for keys outside the `1024`-token relative-bias band (`2,157 tok/s` @ `128K` even at `180 W`).
+4. **Check quality & failure honesty:** Look for real end-to-end task evaluations (e.g. blind SWE-bench repairs, `compaction.keepRecentTokens=4096` for 240K Pi runs) AND parity/reuse caveats (e.g. prefix-reuse retrieval misses, KL vs official checkpoint).
+5. **Run the Impact Gate before reproducing:** Only download/benchmark an external quant on GPU if it can beat your adopted route on BOTH quality and your target regime (`>= 10%`); otherwise, port the orthogonal kernel/scheduler wins onto your native checkpoint!
+
 ---
 
 ## Phase 1 — Establish One Clean Correctness Foothold (~15 min)
