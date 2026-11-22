@@ -2,15 +2,14 @@
 name: intel-xpu-inference-optimisation
 description: >
   Hill-climb local LLM serving speed and context capacity on Intel Arc Pro B60/B70
-  (Battlemage Xe2, bmg_g31) and Intel XPU GPUs across vLLM XPU, llama.cpp SYCL,
-  TensorFold XPU, and exl3xpu: single-user and concurrent decode tok/s, cold prefill
-  tok/s and TTFT, speculative decoding (DSpark, MTP, DFlash), KV cache and SWA
-  max-context tuning, AOT CUTLASS Xe2 kernels, and energy (J/token) under live VRAM,
-  thermal, and correctness gates. Computes Intel Xe2 rooflines first, checks closed
-  arms in DO-NOT-REPEAT.md, runs noise-controlled single-variable A/B tests, and
-  qualifies every winner with realistic model-card sampling and exact retrieval before
-  publishing. Use when optimising, tuning, porting, benchmarking, or writing XPU/SYCL
-  kernels for a model on Intel Arc GPUs.
+  (Battlemage Xe2, bmg_g31) and Intel XPU GPUs across vLLM XPU, TensorFold XPU,
+  exl3xpu, llama.cpp SYCL, and Strata/XeStrata: single-user and concurrent decode
+  tok/s, cold prefill tok/s and TTFT, speculative decoding (DFlash2, DSpark, MTP),
+  KV cache and SWA max-context tuning, 16-byte aligned packs, peer-store TP2, AOT
+  CUTLASS Xe2 kernels, and energy (J/token) under live VRAM, thermal, and 3-class
+  correctness gates. Computes Intel Xe2 silicon rooflines first, checks closed arms
+  (DNR-001..DNR-042), runs noise-controlled single-variable A/B tests, and qualifies
+  every winner with realistic model-card sampling and exact retrieval before publishing.
 ---
 
 # Intel XPU Inference Optimisation (Hill-Climbing on Arc Pro B60/B70 & Xe2)
@@ -70,17 +69,20 @@ Run `scripts/b70_ceiling.py` before writing code or launching long sweeps (`refe
 
 ## Step 2: Non-Negotiable Discipline
 
-1. **One variable per arm, same-session control.** Never combine engine, quant, patch, and drafter in one step without isolating attribution.
-2. **Capacity and correctness before speed.**
+1. **Freeze your correctness lane BEFORE running (`references/methodology.md`):**
+   - **Class 1 (bit-identical):** token IDs `sha256` + full layer-norm `sha256`; any divergence = REJECT.
+   - **Class 2 (different libm/reassociation/tile order):** FP64/FP32 kernel oracle + zero answer-carrying-span flips (including special tokens) + deterministic replay.
+   - **Class 3 (approximate/quantization):** predeclared exact-answer + task quality objective.
+2. **One variable per arm, measured on the engine of record.** Never combine engine, quant, patch, and drafter without isolating attribution, and never benchmark a speedup only against a slow fallback arm.
+3. **Capacity and correctness before speed.**
    - VRAM admission tiers: `< 500 MiB` hard abort; `500–1023 MiB` isolated observation only; `1024–2047 MiB` staged C1; `>= 2048 MiB` preferred C1 performance; `>= 3072 MiB` concurrency.
-   - Server boot is not capacity proof; stage a real prompt + generation request and confirm clean `dmesg` and full VRAM restoration afterward.
-3. **Separate realistic card sampling from greedy diagnostics.**
+   - Always check exact-answer canaries (e.g. the `"14" not "30"` in-head arithmetic test that caught `DNR-009` on symmetric W4A16 27B!).
+4. **Separate realistic card sampling from greedy diagnostics.**
    - Headline speed tables use the model card's sampling (`temperature`, `top_p`, default `reasoning_effort`, `n >= 3` seeds) across the full reachable context window (`0`, `8K`, `32K`, `64K`, `128K`, `max`).
-   - Greedy (`temperature=0`) is an exactness/parity diagnostic, never a substitute for card-sampling speed.
-4. **Never fake cold prefill.** Use unique entropy-first prefixes per request and verify `vllm:prefix_cache_hits_total` delta is `0.0`. Report cold prefill (`prompt_tokens / TTFT`) separately from warm/cached turns and engine-native prefill.
-5. **Never force-kill a server mid-prefill.** Drain/abort requests, send `SIGTERM`, wait for exit, and verify baseline VRAM and clean `dmesg` (`xe` CCS resets often follow forced kills mid-batch).
-6. **Gate custom kernels behind an opt-in switch.** Default `0` must preserve the exact upstream/stock path until parity and quality gates pass.
-7. **Log failures permanently.** Closed arms and root causes go into `docs/DO-NOT-REPEAT.md` (or `PLAN.md`) with a concrete **Revisit when** condition.
+   - Count tokens with tokenizer/server `usage`, NEVER SSE chunks (`DNR-015`).
+5. **Never fake cold prefill or misread display-card thermals.** Use unique entropy-first prefixes (`>= 64` chars) + `prefix_cache_hits_total == 0.0`. Gate non-display B70 `<= 55 C`, display B70 against its own idle (`<= 68 C`, `DNR-024`), and never profile 2-card B70 with `unitrace --device-timing` (`DNR-028`).
+6. **Never force-kill a server mid-prefill.** Drain/abort requests, send `SIGTERM`, wait for exit, and verify baseline VRAM and clean `dmesg`.
+7. **Gate custom kernels behind an opt-in switch** (default `0` = exact stock) and log every closed arm with a concrete **Revisit when** condition.
 
 ---
 

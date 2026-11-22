@@ -10,7 +10,7 @@ A tuned route is complete only when another user or agent can discover it from `
    - Plugin commit SHA and ordered patch stack (`patches/<family>-<engine>/APPLY.md`).
    - Custom kernel header dependencies (e.g. `intel/sycl-tla` and `vllm-xpu-kernels` commit SHAs) and AOT build script.
 2. **Keep custom kernels opt-in:** Gate behind an env var (e.g. `INK2_CUTLASS_MOE=1`, default `0` = exact stock behavior).
-3. **Zero private leaks:** Before committing, scan all changed files with `rg` for local paths (`/data/...`, `/home/...`), private PCI BDFs (`0000:0f:00.0`), local IPs, credentials, raw prompt dumps, or large binaries (never commit `.so` binaries or multi-MB logs).
+3. **Zero private leaks:** Before committing, scan all changed files with `rg` for local paths (`/data/...`, `/home/...`), host PCI BDFs (`0000:XX:00.0`), local IPs, credentials, raw prompt dumps, or large binaries (never commit `.so` binaries or multi-MB logs).
 
 ## 2. Clean Repository Slice (No Mixed Information)
 

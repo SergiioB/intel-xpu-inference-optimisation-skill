@@ -1,0 +1,33 @@
+{
+  "name": "Nemotron-3.5-Lightning-30B-A3B (Hybrid Mamba2/MoE GPTQ-INT4 G64) on 1x Intel Arc Pro B70",
+  "hardware": {
+    "gpu_count": 1,
+    "vram_gib": 31.85,
+    "sustained_bw_gb_s": 525.0,
+    "practical_xmx_tflops": 78.0
+  },
+  "model": {
+    "resident_weights_gib": 17.5,
+    "runtime_overhead_gib": 3.0,
+    "dense_active_gb": 0.85,
+    "expert_active_gb": 1.05,
+    "lm_head_gb": 0.65,
+    "effective_active_params_b": 3.2,
+    "full_attn_visits": 6,
+    "swa_attn_visits": 0,
+    "swa_window": 0,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "attn_hidden_size": 2688,
+    "kv_bytes_per_elem": 2.0,
+    "vllm_swa_batch_multiplier": 0.0
+  },
+  "speculation": {
+    "draft_k": 7,
+    "draft_overhead_ms": 3.0,
+    "verify_compute_overhead_ms": 5.0,
+    "acceptance_lens": [2.8, 3.5, 4.2]
+  },
+  "depths": [0, 8192, 32768, 65536, 131072, 262144],
+  "mbt_sweep": [1024, 2048, 4096]
+}

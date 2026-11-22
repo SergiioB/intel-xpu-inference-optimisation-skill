@@ -1,18 +1,21 @@
 # intel-xpu-inference-optimisation-skill
 
-An open-standard agent skill for **hill-climbing local LLM serving speed, maximum context, and energy efficiency on Intel Arc Pro B60/B70 (Battlemage Xe2, `bmg_g31`) and Intel XPU GPUs** across `vLLM XPU`, `llama.cpp SYCL`, `TensorFold XPU`, and `exl3xpu`.
+An open-standard agent skill for **hill-climbing local LLM serving speed, maximum context, and energy efficiency on Intel Arc Pro B60/B70 (Battlemage Xe2, `bmg_g31`) and Intel XPU GPUs** across **`vLLM XPU`**, **`TensorFold XPU`**, **`exl3xpu`**, **`llama.cpp SYCL`**, and **`Strata / XeStrata`**.
 
-Distilled from measured campaigns in the [Intel Arc Pro B70 Inference Cookbook](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook), inspired by the workflow discipline of `sybil-solutions/inference-optimisation-skill` and specialized for Intel Xe2 hardware, Level Zero, SYCL, Triton, and CUTLASS Xe2.
+Distilled from months of measured campaigns across **8+ model families** and **42 closed arms (`DNR-001`–`DNR-042`)** in the [Intel Arc Pro B70 Inference Cookbook](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook) and B70-DOCS research program, inspired by `sybil-solutions/inference-optimisation-skill` and specialized end-to-end for Intel Xe2 silicon, Level Zero, SYCL, Triton, and CUTLASS Xe2.
 
-## What this workflow has achieved on Intel Arc Pro B70 (32 GB, 230 W)
+## Measured B70 Wins Distilled Into This Skill (32 GB Arc Pro B70, 150–230 W)
 
-| Model / Engine | Lever | Measured Before → After |
+| Model Family / Engine | Lever | Measured Before → After |
 |---|---|---|
-| **Inkling 2 Mini (26.4B native NVFP4/MXFP8)**, 1× B70, vLLM XPU | PR `#69186` FP32 `lm_head` fast path (`torch.mm(..., out_dtype=fp32)`) | Greedy decode `0 / 8K`: `39.7 / 37.5` → **56.4 / 52.0 tok/s** (`+42% / +39%`, 3/3 byte-identical at 8K), `+1.22 GiB` KV |
-| **Inkling 2 Mini**, 1× B70, vLLM XPU + DSpark `k=7` | Custom AOT `bmg_g31` CUTLASS Xe2 native NVFP4+MXFP8 grouped GEMM + SLM route-sort + fused SwiGLU (`INK2_CUTLASS_MOE=1`) | Realistic card-sampling decode `0 / 64K / 104K`: `57.2 / 50.1 / 45.0` → **80.4 / 64.0 / 55.3 tok/s** (`effort=0.2`: **99.2 tok/s**); cold prefill `2K`: `3,172` → **3,920 tok/s**; **8/8 quality/retrieval PASS** |
-| **Inkling 2 Mini**, 1× B70, vLLM XPU | SWA `--max-num-batched-tokens` tuning (`2048 → 1024 / 512`, `u=0.95`) | Max proven context: `106K` → **163K (`160K` real prompt @ 46.2 tok/s)** with DSpark; `200K` → **256K (`256K` real prompt @ 23.1 tok/s)** and **308.7K KV pool** no-spec |
-| **Qwen3.8-27B**, 1× B70, llama.cpp SYCL (`>= 2026-10-29`) | `q8_0` / `q4_0` KV with SYCL flash-attention (`#31125`) | 64K decode: `10.5` (`q5_0/q4_1`) → **22.3 / 23.9 tok/s** (`1.8×–2.1×`) |
-| **Ripple-65B Q4_K_M**, 2× B70, llama.cpp SYCL | `GGML_SYCL_F16=ON` + AOT `bmg_g31` | `pp2048` prefill: `218` → **720 tok/s** (`3.3×`) |
+| **Qwen3.8-27B (Dense 27B)**, 1× B70, TensorFold XPU | MLX 4-bit + DFlash2 + `XPU_ATTN_PREF=256` prefix-attn kernel + `--prompt-cache-gib` | **127 / 115 / 90 / 51 tok/s** code (`0 / 8K / 32K / 131K`), **`drafted == serial`**, warm follow-ups `0.3–1.1 s` up to 131K |
+| **Qwen3.8-27B**, 2× B70, TensorFold `--tp 2` | Peer-store collectives without remote atomics (PR `#3586`) | **165.5 / 143.0 / 117.5 / 76.8 tok/s** (`1.25×–1.5×` vs 1 card, `drafted == serial`); **250K bf16 KV @ 63.3 tok/s** |
+| **Qwen3.8-27B**, 1× B70, `exl3xpu` | EXL3 4bpw + fp8 KV (`287K` pool) + int8 prefill + oneDNN SDPA | **245,583-tok real prompt** at model-card sampling (`63.25 tok/s` w/ MTP3; `426 tok/s` C16 aggregate; MTP off for exact one-shot code) |
+| **Inkling 2 Mini (26.4B Native NVFP4/MXFP8)**, 1× B70, vLLM XPU | PR `#69186` FP32 `lm_head` + AOT `bmg_g31` CUTLASS Xe2 NVFP4+MXFP8 + DSpark `k=7` + SWA `mbt=1024/512` | Greedy `39.7 → 56.4` (`#69186`) → **95.1 tok/s** (`2.4×`); realistic card-sampling **80.4 → 55.3 tok/s** (`0–104K`, `effort=0.2` **99.2**); **3,920 tok/s** prefill; **8/8 PASS**; **163K DSpark / 256K (308.7K KV) no-spec** |
+| **Nemotron-3.5-Lightning-30B-A3B**, 1× B70, vLLM XPU | GPTQ-INT4 G64 + DFlash `n=7` + grouped-topk patch + SSU B8/W4 tuning | **186.6 tok/s** (`p2048/g128`, 150 W) |
+| **Qwen3.8-Flash-Next (125B-A6B)**, 1× B70, Strata SYCL | 16-byte aligned `IQ3_XXS` native pack + MTP (`--spec 4 --spec-min-p 0.5`) | **48.03 tok/s** decode / **989 tok/s** 8K prefill (**2.22×** decode / **5.2×** prefill vs dual-split llama.cpp) |
+| **Qwen3.8-27B**, 1× B70, llama.cpp SYCL (`>= 2026-10-29`) | `#31125` DPAS flash-attn with `q8_0`/`q4_0` KV + `GGML_SYCL_TP_P2P=2` | 64K decode: `10.5` (`q5_0/q4_1`) → **22.3 / 23.9 tok/s** (**1.8×–2.1×**); 2-card peer-store allreduce `28.3 → 32.2` tg128 |
+| **Ripple-65B Q4_K_M**, 2× B70, llama.cpp SYCL | `GGML_SYCL_F16=ON` + AOT `bmg_g31` | `pp2048` prefill: `218` → **720 tok/s** (**3.3×**), 11-turn 118K session `0.0%` sag |
 
 ## Repository layout
 
@@ -22,16 +25,18 @@ skills/intel-xpu-inference-optimisation/
 ├── SKILL.md                                                # Agent skill entry point
 ├── PROMPT.md                                               # Copy of standalone prompt
 ├── references/
-│   ├── ceilings.md                                         # Xe2 roofline, looped MoE, SWA mbt & spec math
-│   ├── levers.md                                           # Proven B70/Xe2 levers ordered by ROI
-│   ├── gotchas.md                                          # Level Zero, SYCL, Triton, vLLM XPU traps
-│   ├── methodology.md                                      # Interleaved A/B, card sampling, energy, VRAM guards
-│   └── publishing.md                                       # Pinning, opt-in gating, sanitization, CI & charts
+│   ├── ceilings.md                                         # Xe2 silicon datapaths (XMX FP16/INT8/INT4, 16B align), looped/MoE/SWA & P2P ceilings
+│   ├── levers.md                                           # Workload regime matrix + 15 ranked B70 levers across all 5 engines
+│   ├── gotchas.md                                          # All 42 closed failure classes (DNR-001..042) & Intel XPU/SYCL/driver traps
+│   ├── methodology.md                                      # 3-class correctness-lane framework, card sampling, energy, VRAM & retrieval gates
+│   └── publishing.md                                       # Pinning, opt-in gating, sanitization, cookbook CI & 2x PIL result graphics
 ├── scripts/
 │   ├── b70_preflight.py                                    # Read-only Intel GPU / VRAM / power / RAM preflight
 │   └── b70_ceiling.py                                      # Stdlib-only Intel Xe2 roofline & SWA-KV calculator
 └── examples/
-    └── inkling2-mini-b70.json                              # Worked B70 Inkling 2 Mini ceiling spec
+    ├── inkling2-mini-b70.json                              # Looped native NVFP4/MXFP8 MoE + SWA + DSpark
+    ├── qwen38-27b-dense-b70.json                           # Dense 27B 4bpw + fp8 KV + MTP3 / DFlash2
+    └── nemotron35-30a3-b70.json                            # Hybrid Mamba2/MoE 30B-A3B + DFlash n7
 ```
 
 ## Quick start
@@ -43,17 +48,14 @@ mkdir -p ~/.config/devin/skills
 cp -r intel-xpu-inference-optimisation-skill/skills/intel-xpu-inference-optimisation ~/.config/devin/skills/
 ```
 
-### Install for any Agent Skills-compatible client (`SKILL.md`)
-Copy `skills/intel-xpu-inference-optimisation/` into your client's skills directory, or feed [`PROMPT.md`](PROMPT.md) directly into your agent.
-
 ### Run the included stdlib-only helpers
 ```bash
-# Read-only Intel XPU host preflight
+# Read-only Intel XPU host preflight (discovers Intel GPUs by PCI BDF, never remembered hwmon indices)
 python3 skills/intel-xpu-inference-optimisation/scripts/b70_preflight.py
 
 # Compute Intel Arc Pro B70 decode, prefill, speculative, and SWA-mbt ceilings
 python3 skills/intel-xpu-inference-optimisation/scripts/b70_ceiling.py \
-  --spec skills/intel-xpu-inference-optimisation/examples/inkling2-mini-b70.json
+  --spec skills/intel-xpu-inference-optimisation/examples/qwen38-27b-dense-b70.json
 ```
 
 ## Companion repositories

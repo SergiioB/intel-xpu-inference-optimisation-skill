@@ -1,31 +1,47 @@
-# Intel Arc Pro B60/B70 & XPU Gotchas (Hard-Won Traps)
+# Intel Arc Pro B60/B70 & XPU Gotchas & Closed Arms (`DNR-001`..`DNR-042`)
 
-Check this list before debugging a crash, OOM, slow boot, or suspicious speed number on Intel XPU.
+Hard-won traps across `vLLM XPU`, `TensorFold XPU`, `exl3xpu`, `llama.cpp SYCL`, `Strata/XeStrata`, Linux `xe` driver, and Intel `compute-runtime`. Read before debugging a crash, OOM, quality failure, or closed optimisation idea.
 
-## 1. vLLM XPU & Level Zero Runtime Traps
+## 1. Quality & Quantization Traps (Check Before Speed!)
 
-- **Linux 107-byte Unix socket limit (`VLLM_RPC_BASE_PATH`):** Running vLLM from a deep campaign directory makes ZeroMQ IPC socket paths exceed 107 bytes and crash before model load. Always point `VLLM_RPC_BASE_PATH` at a short `/tmp/...` directory created with `mktemp -d`.
-- **`uv` hardlink cache corruption when patching venvs:** If a venv was created with `uv --link-mode hardlink`, patching a file in `site-packages/` mutates the shared global `uv` cache. Always copy-unlink-copy (`cp f f.orig && rm f && cp f.orig f`) before running `patch`.
-- **Piecewise graph capture fails on Intel XPU:** Only `-cc.mode=none -cc.cudagraph_mode=FULL_DECODE_ONLY` is reliable. Piecewise capture or dynamic per-batch draft lengths fail with `UR_RESULT_ERROR_OUT_OF_RESOURCES`.
-- **Prefix caching corruption on W4A16 / speculative vLLM XPU stacks:** Keep `--no-enable-prefix-caching` on vLLM XPU W4A16/speculative stacks until upstream cache-hit bugs (vLLM `#53912` class) are verified fixed with a multi-turn corruption check (corruption was observed even on zero-hit cold requests).
-- **Streaming reasoning field name (`delta.reasoning` vs `delta.reasoning_content`):** On vLLM >= 0.34 with `--reasoning-parser`, thinking tokens stream in `delta.reasoning`. Observers that only watch `delta.content` or `delta.reasoning_content` miss TTFT and report broken decode rates.
-- **SWA `--max-num-batched-tokens` cliff:** On SWA-heavy models (like Inkling 2 Mini's 40 SWA visits), setting `mbt=4096` or `8192` reserves 10–17 GiB for SWA in-flight blocks and collapses max context to ~7K. Use `mbt=2048` for speed ladders and `mbt=1024`/`512` for max-context profiles.
-- **Scoped wrapper losing supplementary groups:** Running `systemd-run --scope` as root without preserving supplementary groups drops `render`/`video`/`docker` access. Use `runuser -u <user> -- ...` so group membership is preserved.
+- **Symmetric W4A16 (GPTQ / AutoRound) quality failure on dense 27B (`DNR-009`):** On Qwen3.8-27B, every symmetric INT4 W4A16 export answered `"30"` instead of `"14"` on an in-head arithmetic canary while passing coherence, replay, and perplexity! Always run an exact-answer battery first.
+- **Double-quantizing native NVFP4/MXFP8 checkpoints (`DNR-035`, `DNR-040`, `DNR-041`):** Re-encoding 4-bit NVFP4 experts into GPTQ INT4, EXL3, Q8_0, or BF16 GGUF adds error or bloats bytes with zero accuracy gain (no higher-precision expert source exists).
+- **Never trust filename quant labels (`DNR-014`):** Unsloth UD GGUFs mix per-tensor quant types (e.g. `IQ1_S` inside an `IQ3_XXS` file). Always read the safetensors/GGUF tensor-type census and fail closed on unknown types.
+- **Raw `/v1/completions` prompt-format loops (`DNR-016`):** Nemotron-3.5-Lightning looped `14/18` via raw `/v1/completions` vs `0/18` through `/v1/chat/completions` with its shipped chat template. Check prompt formatting before blaming weights.
+- **Speculative decoding altering greedy output (`DNR-017`, `DNR-034`):** `exl3xpu` MTP3 altered 27% of greedy outputs on Qwen3.8-27B (and dropped working JS pages from `9/9` to `5–6/9`); Inkling DSpark alters greedy hashes vs no-spec. Never claim `drafted == serial` without a direct hash check.
+- **Tiny reassociation / fused-kernel KL drift (`DNR-039`, `RL-222`):** Inkling llama.cpp patch `0002` boosted prefill `2.4x` but had mean KL `0.00112` (failing `<= 1e-4`) and diverged greedy on `4/5` prompts. Never promote an unverified fast kernel.
 
-## 2. SYCL / CUTLASS Xe2 / Compiler Traps
+## 2. vLLM XPU & Level Zero Runtime Traps
 
-- **Missing `cuda_runtime_api.h` when compiling `sycl-tla` headers:** SYCL-TLA headers fall back to CUDA includes unless `-DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET -DCUTLASS_VERSIONS_GENERATED` are all defined on the `icpx` command line.
-- **E4M3 subnormal scales in NVFP4:** Naive float-exponent bit shifts mishandle E4M3 subnormals (`exp == 0`). Use branchless exact E4M3->FP16/FP32 conversion and test both normal and subnormal scales against an FP32 exact reference (`rel_l2 <= 5e-5`).
-- **Missing `-ze-opt-large-register-file`:** Without `-Xs "-device bmg_g31 -options -ze-opt-large-register-file"`, Xe2 CUTLASS tiles spill registers to scratch memory and lose 2x–3x throughput.
-- **DPC++ 2026.1 `SYCL_CACHE_PERSISTENT=1` (`DNR-037`):** Causes regressions/instability on llama.cpp SYCL; set `SYCL_CACHE_PERSISTENT=0`.
-- **`GGML_SYCL_ENABLE_OPT=0` (`DNR-031`):** Disables critical SYCL optimizations; never ship with `=0`.
-- **`torch.topk` wide-input bugs on PyTorch XPU:** Watch for segfaults or slow CPU fallbacks on wide vocabularies; check `lm_head` and sampler dispatch explicitly.
+- **Linux 107-byte Unix socket limit (`VLLM_RPC_BASE_PATH`):** Deep working dirs make ZeroMQ IPC paths exceed 107 bytes and crash before load. Always set `VLLM_RPC_BASE_PATH` to a short `/tmp/...` directory.
+- **`uv` hardlink cache corruption:** Break hardlinks (`cp f f.orig && rm f && cp f.orig f`) before patching any file inside a `uv`-created venv.
+- **Piecewise graph capture fails on Intel XPU:** Use `-cc.mode=none -cc.cudagraph_mode=FULL_DECODE_ONLY`. Piecewise capture or dynamic draft lengths fail with `UR_RESULT_ERROR_OUT_OF_RESOURCES`.
+- **vLLM XPU `v0.31.0` AutoRound AVX-512 SIGILL (`DNR-027`):** The shipped AutoRound XPU library uses AVX-512 host instructions and crashes with `trap invalid opcode` on non-AVX-512 CPUs (e.g. AMD Zen 3 Ryzen 7 5700X3D). Also mount `/dev/dri/by-path` inside Docker containers or oneCCL fails `onecclCommInitRank` with code 11.
+- **Prefix caching corruption on vLLM XPU W4A16 / speculative stacks:** Keep `--no-enable-prefix-caching` until multi-turn corruption checks pass (corruption was reproduced even on zero-hit cold requests).
+- **Streaming reasoning field (`delta.reasoning` vs `delta.reasoning_content`):** On vLLM >= 0.34 with `--reasoning-parser`, thinking tokens stream in `delta.reasoning`. Capture both `delta.reasoning` and `delta.content`.
+- **SWA `--max-num-batched-tokens` collapse:** On SWA-heavy models (40 SWA visits in Inkling), `mbt=4096/8192` collapses max context to `~7K`. Use `mbt=2048` (speed ladder) or `mbt=1024/512` (max context).
+- **Missing PR `#69186` FP32 `lm_head` fast path (`DNR-042`):** Costs `-30%` decode speed and `-1.22 GiB` KV cache per step.
 
-## 3. Hardware, VRAM, and Multi-GPU Traps
+## 3. SYCL, CUTLASS Xe2, TensorFold & llama.cpp Traps
 
-- **Never identify a B70 by a remembered `hwmon` number:** `hwmonN` indices change across reboots. Always resolve `hwmon` and `vram_mm` through PCI BDF (`/sys/bus/pci/devices/0000:XX:00.0/...`) and pin `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1` + `ZE_AFFINITY_MASK`.
-- **Forced container/process kill mid-prefill causes `xe` CCS resets:** Always abort active requests, send `SIGTERM`, wait for drain, and check `dmesg` afterward.
-- **PCIe AER link drops mimic kernel crashes:** Always inspect `dmesg` for PCIe AER replay timeouts or `xe` engine resets before blaming model code.
-- **Direct peer copies do not imply peer atomics:** Stock vLLM TP2 / oneCCL assumes collective patterns that stall or fail on B70 PCIe; use independent single-card servers for multi-user load or peer-store TP2 without remote atomics.
-- **Polling energy wakes idle GPUs:** Read `energy1_input` only at clean phase boundaries (start/end of prefill and decode), not in a tight background loop on an idle card.
-- **Host disk exhaustion silently breaks Docker/JIT caches:** Keep Triton, SYCL, and Hugging Face caches on a spacious data disk and enforce a root-filesystem free reserve (`>= 512 MiB`).
+- **Missing `-DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET -DCUTLASS_VERSIONS_GENERATED`:** Causes `sycl-tla` headers to fail looking for `cuda_runtime_api.h`.
+- **Missing `-ze-opt-large-register-file`:** Causes Xe2 CUTLASS tiles to spill registers to scratch memory (`2x–3x` slowdown).
+- **E4M3 subnormal scales in NVFP4:** Test both normal and subnormal scales (`exp == 0`) against exact FP32 reference (`rel_l2 <= 5e-5`).
+- **`SYCL_CACHE_PERSISTENT=1` on DPC++ 2026.1 (`DNR-031`):** `SIGSEGV` in `PersistentDeviceCodeCache::getItemFromDisc` on `llama.cpp SYCL`. Always set `SYCL_CACHE_PERSISTENT=0`.
+- **`GGML_SYCL_ENABLE_OPT=0` (`DNR-037`):** Disables reordered weight layout and drops decode `-29%`.
+- **`q5_0` K / `q4_1` V KV on post-2026-10-29 `llama.cpp` (`DNR-019`):** Bypasses `#31125` DPAS flash-attn (`10.5` vs `22.3–23.9 tok/s` at 64K); default to `q8_0/q8_0`.
+- **Additive attention bias disables llama.cpp flash-attention (`DNR-036`):** Models with `kq_b != nullptr` (Inkling relative-position bias) cannot use `-fa on` in current llama.cpp.
+- **Disabling Intel NEO direct submission (`DNR-020`):** `EnableDirectSubmission=0` turns every launch into a kernel ioctl (`-6%` 1-card, `-23%` 2-card).
+- **SLM K/V staging in wide 256-lane WG (`DNR-018`):** Spilled registers and slowed TensorFold tree verify **5x** (`46.6 -> 9.0 tok/s` at 32K).
+- **Blindly substituting wide GEMM kernels (`DNR-030`):** `XPU_GU_WIDE64=1` looked faster in isolation but *lost* `-1.1%..-1.9%` end-to-end on TensorFold `--tp 2`. Always validate on the full round.
+- **Cross-queue peer `memcpy` events (`DNR-032`):** `GGML_SYCL_TP_P2P=1` leaked 224K events and segfaulted (`exit 139`); use mode 2 (peer stores + flag).
+
+## 4. Hardware, Profiling, Multi-GPU & Operations Traps
+
+- **Never profile 2-card B70 with `unitrace --device-timing` or unpatched `XPU_PROFILE=1` (`DNR-022`, `DNR-028`):** On `compute-runtime 26.05.37020.3`, cross-device event waits cause hangs, segfaults, and `xe` "Engine memory CAT error" resets on both cards! Use `--host-timing` or per-rank profilers (`EnableImplicitConvertionToCounterBasedEvents=0` or runtime `>= 26.40`).
+- **Never use one 55 C cooldown gate when one B70 drives the desktop (`DNR-024`):** Display B70 idles at `~65–66 C`. Gate each card against its own idle baseline (e.g. non-display `<= 55 C`, display `<= 68 C`) and declare the sustained thermal regime.
+- **Never identify a GPU by a remembered `hwmon` index:** Always resolve `hwmon` and `vram_mm` from PCI BDF (`/sys/bus/pci/devices/0000:XX:00.0/...`) and pin `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1`.
+- **AIB B70 subsystem IDs:** Board-partner B70s (e.g. ASRock `1849:6025`) share PCI device `8086:e223` but NOT Intel's reference subsystem `8086:1701`. Match on `8086:e223`.
+- **Forced kills mid-prefill cause `xe` CCS resets:** Drain requests, send `SIGTERM`, wait for exit, verify baseline VRAM and clean `dmesg`. Check `dmesg` for PCIe AER drops before blaming code.
+- **`systemd-run` traps (`DNR-025`, `DNR-026`):** Pass `--expand-environment=no` (otherwise `$$` expands to `$`), use `runuser -u <user> --` to preserve `render`/`video`/`docker` groups, and verify binaries exist and are newer than sources before queuing runs.
+- **Closed multi-card shortcuts (`DNR-004`, `DNR-005`, `DNR-006`, `DNR-010`, `DNR-011`, `DNR-012`):** Stock vLLM oneCCL TP2 (`-45..-71%`), llama.cpp RPC (`54%`), Cascadia PP2 (`0%`), host-staged second-card MoE caches (`33.4 vs 48.0 tok/s`), and storage-tier NVMe streaming at 5 GB/s are all closed.
