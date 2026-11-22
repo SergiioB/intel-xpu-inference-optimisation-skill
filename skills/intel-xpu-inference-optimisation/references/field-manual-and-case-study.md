@@ -79,3 +79,54 @@ Every step we actually took in one weekend — including the exact wins, surpris
 | **6. 512K Quality** | Skeptic asked: *"Does FP8 noise ruin 512K perplexity?"* | Measured matched BF16 vs FP8 held-out 256-tok technical prose PPL (`4K -> 496K`) + `15%`/`55%` dual-needle recall | `4K–245K`: `-0.48%..+0.41%` (**`+0.07%` @ 245K**, MAE `0.066` nats); **`3.456` @ 384K**, **`3.583` @ 496K**; **`2/2` exact recall @ `495,964` tok!** | **PROVED & PUBLISHED** |
 | **7. External Audit & Fast Kills** | Audited `Danmoreng` EXL3 repo; tested Triton Split-KV `80/128` & priced Adaptive DSpark | Live graph-replay A/B on `80/16` regressed `-10–12%` (`73.4 -> 66.0`, `61.0 -> 53.7`); CUTLASS `M=4` vs `M=8` priced at `2.58 ms` (`<6%`) | Kept official native weights; reverted Split-KV `80/128` immediately; skipped Adaptive DSpark cleanly | **CLOSED & REVERTED** |
 | **8. SYCL `M=1` Decode** | Triton `M=1` `256K` FP8 took `50.24 ms` (`20.07 tok/s`) | Iterated AOT `bmg_g31` SYCL V1 -> V2 -> V3 (`SingleTokSplitKernel`, 4 SGs/WG, contiguous pages, 4-key tiled softmax, `1 KB` SLM E4M3 LUT); discovered SIMT (`M=1`) vs XMX (`M=8`) split & `get_wi_data` spill | Isolated **`4.76x`** (`50.24 -> 10.56 ms`, `78%` GDDR6 BW); live graph-replayed A/B: **`+19.8%` @ 64K**, **`+39.3%` @ 128K**, **`+71.0%` @ 256K (`20.07 -> 34.32 tok/s`!)**, `4/4` + `128K` recall PASS | **SHIPPED (`INK2_SYCL_DECODE_ATTN=1`)** |
+
+---
+
+## 5. Things I Thought That Proved Wrong (Mental-Model Corrections on Real Xe2 Silicon)
+
+These 8 wrong hypotheses — every one of which sounded 100% logical on paper — are the most valuable part of this skill. Internalize them so you recognize the exact trap in seconds:
+
+1. **Wrong thought: *"Branchless `uint8 -> fp16 -> bf16` bit-shift inside Triton `tl.make_tensor_descriptor` will fix the 5.4x FP8 prefill slowdown."***
+   - **What happened:** It got **worse** (`477.7 ms` vs `256.6 ms` at 64K, vs `46.8 ms` BF16)!
+   - **Why:** The root cause was not only scalar FP8 conversion — **1-byte `uint8`/`float8` 2D tensor descriptors break Xe2's 16-bit DPAS block layout** before `tl.dot`.
+   - **Real fix:** Stop fighting 1-byte tensor descriptors; materialize active pages into BF16 (`47.8 ms` = `5.4x` faster) + 64K Chunked-LSE merge (`46.4 ms` @ 128K = **`11x` faster**).
+
+2. **Wrong thought: *"Allocating a `< 256 MiB` temporary BF16 tensor per layer during chunked prefill can't OOM when `2.5 GiB` is free."***
+   - **What happened:** Hit `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` right at `64K`!
+   - **Why:** PyTorch XPU's caching allocator caches every distinct dynamic shape (`n_active = 32, 64, 96, ..., 1024`) across chunked-prefill steps simultaneously, fragmenting gigabytes even though only 256 MiB is live at once.
+   - **Real fix:** Pre-allocate **ONE fixed-size module-level scratch buffer** and slice `buf[:n_active]` in 128-page chunks -> zero fragmentation, zero OOM all the way to `496K`.
+
+3. **Wrong thought: *"Halving KV bytes with FP8 will automatically make `M=8` Triton decode `20–45%` faster at `64K–128K`."***
+   - **What happened:** On stock Triton `attention_triton.py`, FP8 KV decode was **`~12–18%` slower** than BF16 under `104K` (`67.1 -> 43.6` vs `80.4 -> 55.3 tok/s`).
+   - **Why:** Triton's scattered 1-byte FP8 pointer loads + software casts outweighed the 2x DRAM savings until either context became huge or a custom SYCL kernel with a `1 KB` SLM E4M3 LUT replaced it (which DID hit `4.76x` on `M=1` at `256K`!).
+
+4. **Wrong thought: *"My isolated 1-layer microbenchmark shows Split-KV `128/16` (and `80/16`) is `1.4x–3.3x` faster than `40/9`, so live decode will fly."***
+   - **What happened:** Live graph-replayed decode **regressed `-10%` to `-12%`** (`73.4 -> 66.0` @ 64K, `61.0 -> 53.7` @ 128K), even after isolating target layers and reusing scratch!
+   - **Why:** Across 48 visits inside a captured XPU graph, higher split counts inflate sequential combine-kernel work and evict hot weights/KV from L2 cache (`DNR-030`).
+   - **Real fix:** Revert immediately with zero ego. Never promote any kernel change without a live same-binary graph-replayed A/B!
+
+5. **Wrong thought: *"Cooperative 8-token SLM KV sharing (`sg_id = tok 0..7`) in SIMT SYCL will crush Triton on `M=8` just like `M=1` did (`4.76x`)."***
+   - **What happened:** `M=1` SIMT crushed Triton (`10.56 ms` vs `50.24 ms` = `4.76x`), yet `M=8` SIMT ran **`109.8 ms` vs Triton `40.7 ms`** (`2.7x` slower!).
+   - **Why:** **Compute-vs-bandwidth crossover.** `M=8` (`24` rows) at `256K` is **`206 GFLOPs`** — compute-bound on SIMT FP32 FMA (`~2 TFLOPS` effective), whereas Triton `tl.dot` uses hardware XMX DPAS (`~75 TFLOPS`). Conversely, `M=1` (`G=3` rows) wastes `81%` of a `16`-row XMX tile, so SIMT wins `4.76x`!
+   - **Real fix:** Check BOTH FLOPs AND bytes before assuming memory-bound; use **hybrid dispatch (`M=1` -> SYCL SIMT, `M>=2` -> XMX DPAS / ESIMD)**.
+
+6. **Wrong thought: *"Scaling SYCL `joint_matrix` accumulators in registers via `get_wi_data(sg, o_mat)` will remove SLM round-trips and speed up `XMX_V2`."***
+   - **What happened:** `XMX_V2` got **`3x` slower** (`23.7 ms -> 70.6 ms` at 128K)!
+   - **Why:** In `icpx 2026.1`, calling `sycl::ext::oneapi::detail::get_wi_data` inside an inner K-loop forces the compiler to spill the entire `joint_matrix` accumulator to private scratch memory every iteration.
+
+7. **Wrong thought: *"Adaptive DSpark (`0.75` confidence cutoff) gave Danmoreng a big win on EXL3, so it'll give us `+15–25%` on CUTLASS Xe2 too."***
+   - **What happened:** A 3-second pricing script showed CUTLASS Xe2 NVFP4 (`36` visits) drops only **`2.58 ms`** from `M=8` (`11.31 ms`) to `M=4` (`8.73 ms`) — `< 6%` of a `~38 ms` step, failing the 10% Impact Gate before we wrote a single line of scheduler code.
+   - **Real fix:** Never import another engine's lever assuming the same ROI; always price the exact op delta on **your own** kernel first.
+
+8. **Wrong thought: *"My `128K` SYCL retrieval test returned `content=''` — my new SYCL kernel must have broken long-context attention!"***
+   - **What happened:** Inspecting `reasoning` showed the model had already found `'SYCL-128K-99412-OK'` on line 1 of its thought trace and spent `489` reasoning tokens (`max_tokens=256` cut it off before emitting `content`). Raising `max_tokens=512` passed `100%` exact!
+   - **Real fix:** On thinking models, ALWAYS inspect `reasoning` + `completion_tokens_details` before debugging a kernel, and set `max_tokens >= 512` on long-context retrieval checks.
+
+---
+
+## 6. Operational & Upstream-PR Craft (Small Habits That Prevent Disasters)
+
+- **Always break `uv` hardlinks (`stat -c '%h'`) before editing site-packages:** `uv --link-mode hardlink` shares inodes with the global cache; editing in place silently corrupts other venvs.
+- **Never `pkill -f <path>` when your shell command line contains `<path>`:** It kills your own shell mid-script. Filter PIDs via `ps -eo pid,args | awk '/pattern/ && !/awk/ {print $1}' | xargs -r kill -TERM`.
+- **Match upstream repository architecture strictly when preparing PRs:** Do NOT push C++ SYCL build files into a pure-Python/Triton wheel repo (`pyproject.toml` with pure `setuptools` and `ruff`). Split upstream contributions into minimal, single-purpose, independently reviewable PRs (e.g. PR #1 Vision, PR #2 FP8 KV), format with the repo's exact `ruff` config, write CPU-runnable unit tests, and run an independent strict reviewer pass until it gives an explicit `OK` before pushing upstream.
+- **Visually inspect every PNG chart and UI screenshot with `read`:** Humans spot overlapping labels, clipped footers, and stale numbers instantly — never ship a graphic blindly.
