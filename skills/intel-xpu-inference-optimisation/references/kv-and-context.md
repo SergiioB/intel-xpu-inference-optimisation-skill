@@ -42,11 +42,15 @@ A huge architectural insight measured on B70 (`q8_0 K / q4_1 V`):
 
 ### vLLM XPU (Sliding Window Attention `mbt` Knob)
 - vLLM's `SlidingWindowManager` reserves SWA in-flight blocks proportional to `--max-num-batched-tokens` across **every SWA visit** (40 visits in Inkling 2 Mini).
-- **Measured on Inkling 2 Mini (1x B70, BF16 KV):**
-  - `mbt=4096 / 8192`: SWA demands `10.2–17.4 GiB` -> max context collapses to **`~7K`**.
-  - `mbt=2048`: **`106,496`** DSpark (`u=0.93`) / **`200,000`** no-spec (`u=0.95`) — best prefill speed.
-  - `mbt=1024, u=0.95`: unlocks **`163,840`** DSpark (`194.1K` KV, `160K` real prompt @ `46.2 tok/s`) and **`262,144` (256K)** no-spec (`273.8K` KV, `256,000` real prompt @ `23.1 tok/s`).
-  - `mbt=512, u=0.95`: expands KV pool to **`308,696` tokens** no-spec.
+- **Measured on Inkling 2 Mini (1x B70, BF16 vs FP8 E4M3 KV):**
+  - `BF16 KV`, `mbt=4096 / 8192`: SWA demands `10.2–17.4 GiB` -> max context collapses to **`~7K`**.
+  - `BF16 KV`, `mbt=2048`: **`81.9K`** (`84.8K` KV w/ Vision+DSpark), **`106,496`** DSpark (`u=0.93`), **`200,000`** no-spec (`u=0.95`).
+  - `BF16 KV`, `mbt=1024, u=0.95`: **`163,840`** DSpark (`194.1K` KV) and **`262,144` (256K)** no-spec (`273.8K` KV; **`308,696`** KV at `mbt=512`).
+  - **`FP8 E4M3 KV` (`--kv-cache-dtype fp8`)** halves BOTH full-attention KV (`32,768 -> 16,384 B/tok`) AND all 40 SWA reservations:
+    - `mbt=2048, u=0.92` w/ DSpark + Vision: **`177,637` KV (`163K` ctx, `2.1x` vs BF16)** — OCR `107 tok/s`, **64K exact retrieval PASS** (`68.0 tok/s`).
+    - `mbt=1024, u=0.95` w/ DSpark + Vision: **`323,439` KV (`256K` ctx, `1.23x`)** WITH Vision Tower + DSpark `k=7` BOTH ON!
+    - `mbt=1024, u=0.95` no-spec text: **`569,497` KV (`512K` ctx, `1.09x`)** on ONE 32 GB B70!
+  - **FP8 KV Speed Trade-off on Xe2:** Inline FP8 `tl.make_tensor_descriptor` loads in Triton XPU are **5.4x slower** at prefill (`256.6 ms` vs `46.8 ms` BF16 at 64K). Casting active pages of one layer into a **single reusable `256 MiB` BF16 scratch buffer** restores **95%–97% of BF16 prefill speed up to 64K** (`3,557 / 3,240 / 2,776 tok/s` at `8K/32K/64K`) and `100%` of SWA layers (`~12 MiB`) at any context; above 64K inline FP8 prefill slows (`936 tok/s` at 128K), and decode `<= 104K` is `~12–18%` below BF16 (`67.1->43.6` vs `80.4->55.3 tok/s`). Use BF16 KV for peak `<=104K` speed and FP8 KV for `163K–512K` or Vision + DSpark!
 - **Hybrid Mamba / GDN models:** State slots and block alignment cap concurrency, not KV tokens. Keep exact block alignment (e.g. `1,600` vs rounded `2,048` lifted C16 by `+17%`).
 
 ### `llama.cpp SYCL`

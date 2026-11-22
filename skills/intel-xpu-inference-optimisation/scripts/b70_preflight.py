@@ -50,6 +50,15 @@ def discover_intel_gpus() -> list[dict[str, Any]]:
         if drm_dir.exists():
             drm_nodes = sorted(p.name for p in drm_dir.iterdir() if p.name.startswith(("card", "renderD")))
 
+        # Detect whether this GPU drives any connected display connector
+        is_display = False
+        for node in drm_nodes:
+            if node.startswith("card"):
+                for conn in pathlib.Path("/sys/class/drm").glob(f"{node}-*/status"):
+                    if read_text(conn) == "connected":
+                        is_display = True
+                        break
+
         hwmon_info: dict[str, Any] = {}
         hwmon_dir = dev / "hwmon"
         if hwmon_dir.exists():
@@ -77,6 +86,7 @@ def discover_intel_gpus() -> list[dict[str, Any]]:
                 "device_id": device_id,
                 "driver": driver,
                 "drm_nodes": drm_nodes,
+                "is_display": is_display,
                 "vram_visible_avail_mib": vram_avail_mib,
                 "hwmon": hwmon_info,
             }
@@ -157,8 +167,8 @@ def main() -> int:
     for g in report["intel_gpus"]:
         vram = f"{g['vram_visible_avail_mib']} MiB" if g["vram_visible_avail_mib"] is not None else "n/a (need debugfs read)"
         print(
-            f"  {g['pci_bdf']} dev={g['device_id']} drv={g['driver']} nodes={g['drm_nodes']} "
-            f"vram_free={vram} hwmon={g['hwmon']}"
+            f"  {g['pci_bdf']} dev={g['device_id']} drv={g['driver']} display={g['is_display']} "
+            f"nodes={g['drm_nodes']} vram_free={vram} hwmon={g['hwmon']}"
         )
     return 0
 
