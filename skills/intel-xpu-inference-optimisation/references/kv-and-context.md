@@ -50,7 +50,13 @@ A huge architectural insight measured on B70 (`q8_0 K / q4_1 V`):
     - `mbt=2048, u=0.92` w/ DSpark + Vision: **`177,637` KV (`163K` ctx, `2.1x` vs BF16)** — OCR `107 tok/s`, **64K exact retrieval PASS** (`68.0 tok/s`).
     - `mbt=1024, u=0.95` w/ DSpark + Vision: **`323,439` KV (`256K` ctx, `1.23x`)** WITH Vision Tower + DSpark `k=7` BOTH ON!
     - `mbt=1024, u=0.95` no-spec text: **`569,497` KV (`512K` ctx, `1.09x`)** on ONE 32 GB B70!
-  - **FP8 KV Speed Trade-off on Xe2:** Inline FP8 `tl.make_tensor_descriptor` loads in Triton XPU are **5.4x slower** at prefill (`256.6 ms` vs `46.8 ms` BF16 at 64K). Casting active pages of one layer into a **single reusable `256 MiB` BF16 scratch buffer** restores **95%–97% of BF16 prefill speed up to 64K** (`3,557 / 3,240 / 2,776 tok/s` at `8K/32K/64K`) and `100%` of SWA layers (`~12 MiB`) at any context; above 64K inline FP8 prefill slows (`936 tok/s` at 128K), and decode `<= 104K` is `~12–18%` below BF16 (`67.1->43.6` vs `80.4->55.3 tok/s`). Use BF16 KV for peak `<=104K` speed and FP8 KV for `163K–512K` or Vision + DSpark!
+  - **FP8 KV Speed & Long-Context Quality on Xe2 (Measured 4K -> 496K!):**
+    - Inline FP8 `tl.make_tensor_descriptor` loads in Triton XPU are **5.4x–11x slower** at prefill (`256.6 ms` vs `46.8 ms` BF16 at 64K; `~510 ms` at 128K). Casting active pages into **ONE fixed-size reusable `256 MiB` BF16 scratch + exact FP32 online FlashAttention LSE chunking across 64K key windows** recovers **91%–97% of native BF16 prefill speed ALL THE WAY TO 512K** (`1,822 tok/s` @ 128K, `1,378 tok/s` @ 245K, `1,055 tok/s` @ 384K, **`905 tok/s` @ 496K**, `46.4 ms` vs `510 ms` at 128K = **11x speedup**!).
+    - **Measured BF16 vs FP8 Held-Out Perplexity & 496K Dual-Needle Recall (Inkling 2 Mini, `model_max_length=1M`, L2-clipped K + RMSNormed V):**
+      - `4K`–`245K` matched vs BF16: **`-0.48%` to `+0.41%`** (`+0.07%` at `245,760` tokens: `3.4536` vs `3.4512`, token logprob MAE `0.066` nats — **does not grow with depth!**).
+      - `384K` (`393,216`): **`3.4557`** (`+0.06%` vs `245K`); `496K` (`496,000`): **`3.5833`** (`+3.7%` vs `245K`, zero collapse).
+      - **Dual-needle exact retrieval (`15%` oldest KV + `55%` mid KV):** **`2/2` EXACT PASS at BOTH `245,726` tokens (`181.8 s`) AND `495,964` tokens (`542.7 s`)!**
+    - Decode `<= 104K` stays `~12–18%` faster on BF16 (`80.4->55.3` vs `67.1->43.6 tok/s`); use BF16 KV for peak `<=104K` speed and FP8 KV for `163K–512K` or Vision + DSpark!
 - **Hybrid Mamba / GDN models:** State slots and block alignment cap concurrency, not KV tokens. Keep exact block alignment (e.g. `1,600` vs rounded `2,048` lifted C16 by `+17%`).
 
 ### `llama.cpp SYCL`
