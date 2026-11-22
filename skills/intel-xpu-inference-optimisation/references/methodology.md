@@ -45,3 +45,11 @@ Declare the change class in `PLAN.md` **before** running the candidate. Never pr
    - Diagnostics/arena probes: never allocate beyond `free - 4 GiB` and never stress the display card.
 5. **Post-run cleanliness proof:** Verify `min_vram_mib`, `vram_after_mib` restored to baseline, `caps_after_uw` unchanged, and `dmesg_ok` (zero `xe` resets or PCIe AER drops).
 6. **Mandatory quality & retrieval battery:** Always include exact in-head arithmetic (the `"14" not "30"` canary that caught `DNR-009`), structured JSON, code state-trace, boundary logic, multi-turn correction, and multi-depth needle retrieval (`1.4K`, `8.5K`, `33.8K`, `135K+`). Six canaries prove only smoke health, never general quality.
+
+## 5. Long-Context Quantized / FP8 KV Quality Gate
+
+Never ship a 256K–512K quantized KV pool on capacity alone — verify that quantization noise does NOT accumulate across the full context window:
+
+1. **Matched BF16 vs quantized KV held-out perplexity:** Build a strictly held-out natural technical prose evaluation slice (`256` tokens, excluded from the prefix corpus) conditioned on `4K, 32K, 64K, 128K, 245K` (and ultra-deep `384K, 496K` beyond BF16's VRAM ceiling). Score via `/v1/completions` with `echo=True, logprobs=1, max_tokens=1, temperature=0` and report `NLL`, `PPL`, `ΔPPL (%)`, and per-token `logprob MAE`.
+2. **Dual-needle recall spanning oldest + middle KV:** Bury two unique keys at **`~15%` depth (oldest KV entries)** and **`~55%` depth (middle KV)** inside real prose/code up to the maximum usable context (`245K` and `496K`) and verify **`2/2` exact recall**. For reasoning models, set `max_tokens >= 384` (never `128`, which can saturate `<thinking>` and return empty `content=""`).
+3. **Check architecture-level KV bounds:** Check whether the model normalizes/clips K & V before KV storage (e.g., Inkling 2 L2-clips K and RMSNorms V right before KV write, which kept FP8 KV within `-0.48%..+0.41%` PPL of BF16 through `245K`, `3.58` PPL at `496K`, and `2/2` exact recall at `495,964` tokens). Never generalize that result blindly to standard unclipped transformers without re-measuring!
