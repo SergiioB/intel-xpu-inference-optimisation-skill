@@ -26,8 +26,12 @@ skills/intel-xpu-inference-optimisation/
 ├── PROMPT.md                                               # Copy of standalone prompt
 ├── references/
 │   ├── ceilings.md                                         # Xe2 silicon datapaths (XMX FP16/INT8/INT4, 16B align), looped/MoE/SWA & P2P ceilings
-│   ├── levers.md                                           # Workload regime matrix + 15 ranked B70 levers across all 5 engines
-│   ├── gotchas.md                                          # All 42 closed failure classes (DNR-001..042) & Intel XPU/SYCL/driver traps
+│   ├── quantization.md                                     # 6 quant axes, format showdown (NVFP4/EXL3/MLX/AutoRound/GGUF/IQ/FP8), drafter economics
+│   ├── kv-and-context.md                                   # K/V KL-divergence table (q8_0 vs q4_0 K cliff), 3.8x dense-vs-MoE KV, SWA mbt, 11-turn sag
+│   ├── engines-and-topology.md                             # 6-engine capability matrix, 150W MoE vs 180W/230W Dense power sweet spots, dual-B70 TP2
+│   ├── kernels-xe2.md                                      # AOT bmg_g31 CUTLASS/SYCL/ESIMD patterns, 16B alignment, why megakernels/SLM staging fail
+│   ├── levers.md                                           # Workload regime matrix + 15 ranked B70 levers across all 5 engines & 8+ models
+│   ├── gotchas.md                                          # All 42 closed failure classes (DNR-001..042) & Intel XPU/SYCL/driver/profiling traps
 │   ├── methodology.md                                      # 3-class correctness-lane framework, card sampling, energy, VRAM & retrieval gates
 │   └── publishing.md                                       # Pinning, opt-in gating, sanitization, cookbook CI & 2x PIL result graphics
 ├── scripts/

@@ -1,0 +1,50 @@
+# Battlemage Xe2 (`bmg_g31`) GPU Kernel Engineering Guide
+
+Only write or modify GPU kernels after (1) config/engine levers plateau, (2) profiling proves a removable wall-time share that clears `>= 10%` end-to-end, and (3) your correctness lane (Class 1 / Class 2 / Class 3) is frozen in `PLAN.md`.
+
+---
+
+## 1. What Wins on Intel Xe2 (`bmg_g31`)
+
+1. **AOT compilation with large GRF mode:**
+   ```bash
+   icpx -fsycl -fsycl-targets=spir64_gen \
+     -Xs "-device bmg_g31 -options -ze-opt-large-register-file" \
+     -O3 -std=c++20 -fPIC -shared \
+     -DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET -DCUTLASS_VERSIONS_GENERATED
+   ```
+   - `128 KB SLM` per Xe-core; `256` GRF (`-ze-opt-large-register-file`) prevents catastrophic scratch-memory spills on CUTLASS XMX tiles.
+   - Always compile against pinned `intel/sycl-tla` + `vllm-xpu-kernels` headers so `cuda_runtime_api.h` is never pulled in.
+2. **16-byte aligned weight layouts:** Xe2 splits misaligned 16-byte global loads (`2.3x–4.7x` measured throughput delta in Strata). Repack unaligned formats (`IQ3_XXS` 98 B, `IQ4_XS` 136 B, `Q8_0` 34 B) or use planar register layouts (stride-3 register regions turn into slow per-element moves!).
+3. **CUTLASS Xe2 grouped GEMM + 1-WG SLM route-sort + fused activation (`M=8..2048`):**
+   - On Inkling 2 Mini, native NVFP4 (`e2m1`+`e4m3`/16, branchless exact E4M3 subnormal+normal scale decode, `rel_l2 <= 5e-5` vs FP32) CUTLASS Xe2 + `vllm-xpu-kernels` MXFP8 CUTLASS Xe2 + 1-WG SLM route-sort + fused softcapped SwiGLU cut `M=8` verify 44-visit MoE time from ~93 ms to ~25 ms and lifted end-to-end card-sampling decode **+40.5% (`57.2 -> 80.4 tok/s`)** and cold prefill **+23.6% (`3,172 -> 3,920 tok/s`)**.
+   - Keep a safe fallback to PyTorch `argsort`/`scatter_add` when route count exceeds the 1-WG SLM sort ceiling.
+4. **Fused multi-token MoE GEMV (`M=2..8`, e.g. `mul_mat_vec_q_moe_mt`):** Prevents speculative verification from degrading into `k` serial GEMVs or padded `BM=16` prefill tiles.
+5. **Prefix-attention DPAS without wide SLM staging (`XPU_ATTN_PREF=256`):** Splits long-context prefix attention cleanly across Xe2 DPAS units (`90 tok/s @ 32K`, `51 tok/s @ 131K` on TensorFold 27B).
+6. **Peer-store dual-card collectives without remote atomics:** Write partial buffers directly across PCIe (`~19.9 us` for 160 KiB) and synchronize with a lightweight flag — never cross-queue `memcpy` events (`DNR-032`) or remote atomics (absent on B70 PCIe).
+7. **Always gate custom kernels behind an opt-in env flag** (e.g. `INK2_CUTLASS_MOE=1`, default `0` = exact stock behavior) and test **under graph replay** (`FULL_DECODE_ONLY`), never only eager mode!
+
+---
+
+## 2. What FAILS on Intel Xe2 (Closed Kernel Classes — Do Not Waste Time)
+
+| Closed Pattern | Measured Outcome on B70 | Root Cause |
+|---|---|---|
+| **Persistent Megakernels (`ADR-0009`)** | Closed by architecture audit | No safe global cross-workgroup barriers across all 32 Xe-cores; persistent occupancy conflicts with 256-GRF XMX tiles; decode is bandwidth/issue-bound, not launch-bound once graphs are ON |
+| **Wide 256-lane WG SLM K/V staging (`DNR-018`)** | **5x SLOWER** (`46.6 -> 9.0 tok/s` at 32K) | Register pressure (`6 Q heads x 16 lanes` per subgroup @ 256 GRF) spills to scratch |
+| **Fusing tiny kernels under graph replay** | `0%` end-to-end gain | XPU graphs already amortize launch overhead; wall time lives inside the large GEMM/GEMV/attention kernels |
+| **Software pipelining / manual LSC prefetch in decode GEMV** | `M=16` `39 -> 86 ms` (slower) or noise | Register spills destroy occupancy on Xe2 |
+| **Lookup-table (LUT) dequant codebooks** | **4x slower** than ALU bit-unpack | SLM bank conflicts & latency lose to register ALU bit-ops on Xe2 |
+| **Subgroup-shuffle probe trellis without DPAS (`DNR-029`)** | `28.7x` (`M=1`) to `62x` (`M=8`) slower than DPAS INT4 | 4 shuffles + 32-bit mul without DPAS starves XMX |
+| **Blind microbench-driven GEMM swaps (`DNR-030`)** | `-1.1%` to `-6.1%` end-to-end (`XPU_GU_WIDE64=1`) | Isolated kernel time did not shrink the critical path of the full speculative round |
+| **2-card `unitrace --device-timing` (`DNR-022`, `DNR-028`)** | Hangs, segfaults, `xe` Engine memory CAT error | Cross-device timestamped event wait bug on `compute-runtime 26.05` (use `--host-timing` or per-rank profilers) |
+
+---
+
+## 3. Mandatory Kernel Verification Checklist
+
+Before running a full benchmark with any new/modified Xe2 kernel:
+1. **Unit parity vs exact FP32/FP64 reference** across every row count `M` served (`M = 1, 2, 4, 8, 16, 64, 512, 2048`) AND edge-case scales (including E4M3 subnormals, zero rows, masked padding tokens).
+2. **Graph capture & replay check:** Verify the kernel runs identically inside `FULL_DECODE_ONLY` XPU graph replay vs eager mode (no host-side dynamic allocations or broken pointer captures!).
+3. **Full-round attribution:** Interleaved `control -> candidate -> control` on the actual engine of record.
+4. **Correctness lane + scenario suite:** Exact-answer battery + multi-depth retrieval + `dmesg` clean + VRAM restored to baseline.
