@@ -51,6 +51,22 @@ When another engineer publishes an impressive B70 repo or alternate quant (e.g.,
 4. **Check quality & failure honesty:** Look for real end-to-end task evaluations (e.g. blind SWE-bench repairs, `compaction.keepRecentTokens=4096` for 240K Pi runs) AND parity/reuse caveats (e.g. prefix-reuse retrieval misses, KL vs official checkpoint).
 5. **Run the Impact Gate before reproducing:** Only download/benchmark an external quant on GPU if it can beat your adopted route on BOTH quality and your target regime (`>= 10%`); otherwise, port the orthogonal kernel/scheduler wins onto your native checkpoint!
 
+### Phase 0.6 — Engine Release Examination & Multi-Track Parallel Orchestration
+
+When a new engine release drops (e.g. `TensorFold v1.3.4`, `Strata v0.2.20`, `llama.cpp` PRs, `compute-runtime 26.40+`), examine it thoroughly **off-GPU** before burning a single GPU second:
+
+1. **Audit the exact commit delta (never trust release-note headlines alone):**
+   - Check whether a new kernel is **default ON vs opt-in**, whether its speedup applies to **plain (`serial`) decode, drafted decode, or both** (e.g. TensorFold `#3960` `attn_merge` `+40% @ 121K` boosts plain decode only while drafted is level), and whether old flags/envs were removed (`XPU_ATTN_PREF` dropped in `v1.3.4`).
+   - Check compiler/driver compatibility against your live `ocloc` / `icpx` / `compute-runtime` version (e.g. `-cl-intel-128-GRF-per-thread` rejected by `ocloc 26.05.1`; `-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,...` needed by `icpx 2026.1+`).
+   - Check **silent behavioral overrides** (does the engine force `thinking=none`, alter chat templates, require a specific pack format like `MLX 4/32`, or need `-lv 4` verbosity to emit lazy-mmap proof logs?).
+   - Run a **continuous driver/firmware radar** alongside engine releases: `intel/compute-runtime` (ULLS latency, peer-import, `unitrace` multi-card fixes), `oneapi-src/level-zero`, Linux `xe` KMD (`min_freq` BMG P2P floor), and GuC firmware (`70.65+` `#948` reset fixes).
+2. **Parallelize cleanly with ONE GPU owner + off-GPU tracks:**
+   - **Hard rule:** NEVER run two GPU benchmarks concurrently on the same host.
+   - **Winning pattern:** Assign **one exclusive GPU owner** (live dual-B70 bring-up & benchmark) while running **1–2 zero-GPU parallel tracks**: (a) off-GPU AOT release build (`nice -19 -j 4`) + source audit + ready-to-run preflight-guarded benchmark script, (b) primary-source Breakthrough Radar, or (c) independent read-only upstream PR code reviews.
+3. **Fresh-Tree Script & Patch Verification Gate (before publishing any build script or `.patch`):**
+   - Never assume a build script or `.patch` works just because it ran in your dev tree — dev trees silently hide missing `-I` include paths, missing `-DTORCH_EXTENSION_NAME`, missing `-spirv-ext` flags, missing `ocloc` checks, or hand-edited patch hunk counts!
+   - Test every published `build-*.sh` and `.patch` **verbatim** against a clean upstream checkout and verify `python -c "import _ext"` + idempotent second run before publishing.
+
 ---
 
 ## Phase 1 — Establish One Clean Correctness Foothold (~15 min)
