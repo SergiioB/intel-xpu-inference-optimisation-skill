@@ -132,3 +132,22 @@ These 8 wrong hypotheses — every one of which sounded 100% logical on paper �
 - **Verify every published build script & `.patch` verbatim on a clean upstream checkout:** Dev trees hide missing `-I` paths, missing `-DTORCH_EXTENSION_NAME`, missing `-Xspirv-translator -spirv-ext=...` (required on `icpx 2026.1+`), missing `command -v ocloc` checks, and malformed hand-edited hunk line counts (caught by external contributor testing!). Always test verbatim on a fresh tree and confirm the built `.so` imports cleanly.
 - **Check log verbosity before declaring a runtime path broken:** `llama-server` requires `-lv 4` to emit lazy-mmap (`-lzm on`) Engram prefetch INFO lines; an earlier HY4 Flash canary parked solely because default log verbosity hid the proof line.
 - **Visually inspect every PNG chart and UI screenshot with `read`:** Humans spot overlapping labels, clipped footers, and stale numbers instantly — never ship a graphic blindly.
+
+---
+
+## 7. The 2-Minute Zero-GPU Multi-GPU SYCL Engine Audit (How We Diagnosed `Strata v0.2.20` HY4-Flash)
+
+When dropped into an unfamiliar multi-file SYCL inference engine (e.g. 16,800 lines across 30+ files) whose measured speed is far below roofline (`251 tok/s` prefill, `18.7 tok/s` decode) or has exit faults, **do not guess or blindly tune CLI flags.** Run these 4 high-signal checks on logs + source code **off-GPU**:
+
+1. **Check VRAM symmetry vs. actual card load (look for stranded GDDR6!):**
+   - Read the startup log: if Card 1 (primary, holding trunk + KV + experts) has `~4 GiB` free while Card 0 (peer, holding ONLY experts) has **`13.4 GiB` free** AND `25.3 GB` of experts are spilling to host RAM, immediately grep the VRAM budget flag!
+   - One line (`sy_graph.h:149`) reused the primary card's `--vram-experts-gb 17` cap on the peer card too -> adding `--peer-vram-experts-gb 25` moves `+8 GiB` (~2,300 hottest Zipf experts) off slow CPU/RAM straight into 521 GB/s GDDR6.
+2. **Diff the Primary-GPU kernel path against the Peer-GPU kernel path (the #1 multi-GPU engine trap!):**
+   - Engine authors almost always optimize the primary single-GPU path first (`SG16 XMX 8x16x16 grouped GEMM` for prefill; `SG16 + Q8_1_G64 pre-quant + SLM + dedup` for decode) and leave the secondary peer-GPU path on an older v1 kernel (`REQD_SG32`, ungrouped 1-token GEMV!) or serialized call!
+   - Checking `sy_graph.h:1138-1139` + `sy_peer.h:483-621` immediately revealed BOTH: (a) Peer GPU 0 ran **serially after** Primary GPU 1 finished (zero dual-GPU overlap), AND (b) Peer GPU 0 evaluated 4K-token prefill with the **1-token `SG32` decode kernel** (`~128x` redundant weight reads + `656` host-GPU sync barriers per 4K chunk!).
+   - **Clean fix pattern:** Reuse the primary GPU's already-proven XMX grouped GEMM and `SG16+preq8+SLM` decode kernels by parameterizing them on `sycl::queue& q` (so zero kernel math is rewritten), launch Peer GPU 0 **asynchronously before** Primary GPU 1, and gate every new path behind a same-binary opt-out env var (`HY4S_PEER_PF_LEGACY=1`, `HY4S_PEER_DEC_SG32=1`) + phase timer (`HY4S_STEP_TIMING=1`)!
+3. **Separate exit-time `dmesg` faults from inference-time faults:**
+   - When `xe` fires `Engine reset: engine_class=bcs` (blitter copy engine) on BOTH cards **exclusively on process exit** (never during inference), grep `exit|QUIT|release` immediately.
+   - Found `sy_serve.h:531` calling `_exit(0)` (`hy4s_exit_fast(0)`) without draining `Q()`, `gx->wait_all()`, `vcache->wait_copy()`, or `peers->release()`, plus `probe_p2p` leaving `ext_oneapi_enable_peer_access` enabled after a cross-context failure! Draining every queue + disabling failed peer access before `_exit(0)` directly targets exit-only `bcs` resets.
+4. **Always build and peer-review kernel patches OFF-GPU while another run owns the cards:**
+   - Copy into a disjoint `src-opt/` tree (never mutate the measured baseline tree!), compile AOT with `nice -n 19`, generate a clean `git diff` patch, and run a strict read-only fresh-context audit for queue synchronization, device-memory allocation/free pairing, and ascending reduction parity **before** spending a single GPU minute!
