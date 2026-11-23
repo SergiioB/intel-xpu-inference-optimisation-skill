@@ -77,7 +77,7 @@ Every step we actually took in one weekend — including the exact wins, surpris
 | **4. Vision** | Plugin raised `NotImplementedError` | Diffed 651-line NVIDIA ViT (`607 MiB` BF16); replaced 1 PTX line + CUDA FA with PyTorch XPU + `F.scaled_dot_product_attention(..., is_causal=False)` | `+0.55 GiB` VRAM, **`29.3 ms`** for 2 images (`cos=0.9994`), **`4/4` live multimodal PASS** (chart OCR `107 tok/s`, counting `170 tok/s`, 2-img) | **SHIPPED** |
 | **5. FP8 KV** | `attention.py` blocked `fp8`; then `5.4x` slow prefill & `64K` OOM! | Enabled `fp8_e4m3fn`; 5s probe caught 1-byte Triton descriptor slowdown (`256.6 vs 46.8 ms`) & dynamic `torch.empty` fragmentation -> built **ONE `256 MiB` reusable BF16 scratch + 64K Chunked-LSE** (`lse_max_err=5.7e-6`) | **`11x`** faster FP8 prefill @ 128K+ (`2,701 @ 64K`, `2,195 @ 128K` Vis+DSpark; `905 @ 496K`), **`323K` KV w/ Vision+DSpark** & **`569K` KV (`512K`) no-spec!** | **SHIPPED** |
 | **6. 512K Quality** | Skeptic asked: *"Does FP8 noise ruin 512K perplexity?"* | Measured matched BF16 vs FP8 held-out 256-tok technical prose PPL (`4K -> 496K`) + `15%`/`55%` dual-needle recall | `4K–245K`: `-0.48%..+0.41%` (**`+0.07%` @ 245K**, MAE `0.066` nats); **`3.456` @ 384K**, **`3.583` @ 496K**; **`2/2` exact recall @ `495,964` tok!** | **PROVED & PUBLISHED** |
-| **7. External Audit & Fast Kills** | Audited `Danmoreng` EXL3 repo; tested Triton Split-KV `80/128` & priced Adaptive DSpark | Live graph-replay A/B on `80/16` regressed `-10–12%` (`73.4 -> 66.0`, `61.0 -> 53.7`); CUTLASS `M=4` vs `M=8` priced at `2.58 ms` (`<6%`) | Kept official native weights; reverted Split-KV `80/128` immediately; skipped Adaptive DSpark cleanly | **CLOSED & REVERTED** |
+| **7. External Audit & Fast Kills** | Audited external EXL3 serving route; tested Triton Split-KV `80/128` & priced Adaptive DSpark | Live graph-replay A/B on `80/16` regressed `-10–12%` (`73.4 -> 66.0`, `61.0 -> 53.7`); CUTLASS `M=4` vs `M=8` priced at `2.58 ms` (`<6%`) | Kept official native weights; reverted Split-KV `80/128` immediately; skipped Adaptive DSpark cleanly | **CLOSED & REVERTED** |
 | **8. SYCL `M=1` Decode** | Triton `M=1` `256K` FP8 took `50.24 ms` (`20.07 tok/s`) | Iterated AOT `bmg_g31` SYCL V1 -> V2 -> V3 (`SingleTokSplitKernel`, 4 SGs/WG, contiguous pages, 4-key tiled softmax, `1 KB` SLM E4M3 LUT); discovered SIMT (`M=1`) vs XMX (`M=8`) split & `get_wi_data` spill | Isolated **`4.76x`** (`50.24 -> 10.56 ms`, `78%` GDDR6 BW); live graph-replayed A/B: **`+19.8%` @ 64K**, **`+39.3%` @ 128K**, **`+71.0%` @ 256K (`20.07 -> 34.32 tok/s`!)**, `4/4` + `128K` recall PASS | **SHIPPED (`INK2_SYCL_DECODE_ATTN=1`)** |
 
 ---
@@ -114,7 +114,7 @@ These 8 wrong hypotheses — every one of which sounded 100% logical on paper �
    - **What happened:** `XMX_V2` got **`3x` slower** (`23.7 ms -> 70.6 ms` at 128K)!
    - **Why:** In `icpx 2026.1`, calling `sycl::ext::oneapi::detail::get_wi_data` inside an inner K-loop forces the compiler to spill the entire `joint_matrix` accumulator to private scratch memory every iteration.
 
-7. **Wrong thought: *"Adaptive DSpark (`0.75` confidence cutoff) gave Danmoreng a big win on EXL3, so it'll give us `+15–25%` on CUTLASS Xe2 too."***
+7. **Wrong thought: *"Adaptive DSpark (`0.75` confidence cutoff) gave a big win on an external EXL3 stack, so it'll give us `+15–25%` on CUTLASS Xe2 too."***
    - **What happened:** A 3-second pricing script showed CUTLASS Xe2 NVFP4 (`36` visits) drops only **`2.58 ms`** from `M=8` (`11.31 ms`) to `M=4` (`8.73 ms`) — `< 6%` of a `~38 ms` step, failing the 10% Impact Gate before we wrote a single line of scheduler code.
    - **Real fix:** Never import another engine's lever assuming the same ROI; always price the exact op delta on **your own** kernel first.
 
@@ -157,7 +157,7 @@ When dropped into an unfamiliar multi-file SYCL inference engine (e.g. 16,800 li
 
 ## 8. Deep-Context Competitive Post-Mortem (`64K–262K`): Why Our Native Route Lagged & How to Never Leave `20–60%` on the Table Again
 
-After shipping our `3,920 tok/s` @ 2K / `80.4 tok/s` @ 0K / `512K` FP8 native Inkling 2 Mini route, an external EXL3 route (`Danmoreng/intel-b70-inkling2-mini-vllm`, Nov 23) beat our **`64K–262K`** serving speeds (`2,187` vs `1,378 tok/s` prefill @ 245K; `61.8–74.5` vs `43.6 tok/s` deep FP8 decode) **even at `180 W` vs `230 W`**. Auditing his exact commits (`27ea9c15`, `c1dde8dc`, `d1f14611`) proved **none of those deep-context wins required EXL3 quantization** — every single one was an orthogonal kernel or runtime mechanism we had stopped one layer too early on!
+After shipping our `3,920 tok/s` @ 2K / `80.4 tok/s` @ 0K / `512K` FP8 native Inkling 2 Mini route, an external EXL3 serving route beat our **`64K–262K`** serving speeds (`2,187` vs `1,378 tok/s` prefill @ 245K; `61.8–74.5` vs `43.6 tok/s` deep FP8 decode) **even at `180 W` vs `230 W`**. Auditing the underlying kernel and runtime changes proved **none of those deep-context wins required EXL3 quantization** — every single one was an orthogonal kernel or runtime mechanism we had stopped one layer too early on!
 
 ### The 5 Specific Mistakes We Made (And Their Exact Fixes)
 
