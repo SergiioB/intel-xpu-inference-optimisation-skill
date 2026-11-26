@@ -58,3 +58,44 @@ Measured on B70 (`QUANTIZATION-AND-DRAFTERS.md`):
    - **Matched high-fidelity target formats** (`TensorFold` MLX 4-bit + DFlash2: `127 tok/s` lossless `drafted == serial`).
 4. **Draft-head quantization & vocab pruning:** Quantizing the native MTP head separately (`Draft INT4 overlay`) saved `+39.6% / +48.6%` on the GPTQ stack; pruning the draft LM head vocabulary leaves target verification lossless while cutting draft head bytes up to 8x.
 5. **Sweep draft depth `k` per workload:** Per-position acceptance decays sharply past positions 4–5 on natural text (`~0.1–0.3`); depth `k=4` beat `k=6` by `10–20%` on dense 27B. Always report both accepted tokens/round AND per-position marginal survival.
+
+
+---
+
+## 5. 12-Family Quantization Study, `HF-INT4-G16` (`/1` & `/2`), `BiasCorr` & Ultra-Low-Bit Laws (v3.9.0)
+
+Full 12-family empirical study (`Qwen3.8-27B`, `Gemma-4-26B-A4B`, `Qwen3.6-35B-A3B`, `Gemma-4-E4B`, `Granite-4.0-h-tiny`, `Qwen3-8B`, `OLMo-2-7B`, `OLMoE-1B-7B`, `Llama-3.2-3B`, `Phi-4-mini`, `Qwen2.5-1.5B`, `SmolLM2-1.7B`; 49 sanitized receipts, Cookbook `v1.24.0` + `vllm-hf-int4-g16-xpu v0.2.0`) proved the following reusable engineering laws:
+
+### 5.1 12-Family Data-Free Format Hierarchy & Trellis vs Scalar Boundary
+- **`Had128NoPerm + HF-INT4-G16` (`4.25–4.26 bpw`):** Symmetric INT4 weights with progressive group-16 scales (`W_hat = D_row * (q * u_g)`, `q in [-8..+7]`, `u_g in [1..16]`, so `q * u_g in [-128..+112] subset INT8` natively — zero zero-point plane, exact `INT8` XMX DPAS, safe `INT32` accumulator bound for `K <= 65,536`).
+- **12-family sweep result (data-free, causal next-token KL vs BF16, `pos 0` excluded):**
+  - Beats `MLX-4bit` (`asym G64`, `4.50 bpw`) in **`12/12`** tested model families.
+  - Beats `SymINT4-G128 RTN` in **`11/11`** families with that arm, and beats shipped calibrated `GPTQ-Int4-sym-G128` on `Qwen3.8-27B` (`0.0904` vs `0.1757` combined KL; code KL `0.149` data-free / `0.129` with BiasCorr vs `0.302` GPTQ — less than half).
+  - **Weight sensitivity (`V` vs `K`):** `v_proj` quantization hurts more than `k_proj` in **`11/12`** families (only `Qwen2.5-1.5B` reversed).
+  - **Format-by-rotation interaction:** Contiguous block Hadamard rotation (`Had128NoPerm`, zero online permutation scatter, `24.3x` faster than naive online gather) strongly helps uniform INT4, while hurting logarithmic `NVFP4-4/6`.
+  - **Trellis (`TFQ3-4b`) vs scalar (`HF-INT4-G16`) boundary:** Trellis coding (`4.00 bpw`) still wins pure rate-distortion per bit (`0.0253 / 0.1104` vs `0.0318 / 0.1480` on matched 400 matrices). Scalar `HF-INT4-G16` wins on simple live Xe2 serving (`W4A8-INT8` prefill + `W4A16` decode from one packed buffer) and unmodified BF16 embeddings/`lm_head`.
+
+### 5.2 Format Contracts: `hf_int4_g16/1` (Dense `Had128`) vs `hf_int4_g16/2` (MoE Uniform `Had64`)
+- **`hf_int4_g16/1`:** Dense `Had128` contract (`K % 128 == 0`). Backward-compatible byte-for-byte between `v0.1.0` and `v0.2.0` (`308/308` kernel outputs bit-identical SHA-256).
+- **`hf_int4_g16/2`:** Uniform `Had64` contract for MoE and modern architectures whose expert projections satisfy `K % 64 == 0` but NOT `K % 128 == 0` (e.g., `Gemma-4-26B` `K = 704, 2112`).
+- **Rule:** Never mix `Had128` and `Had64` blocks ad hoc inside one checkpoint without enforcing an explicit `had_block_rule` at load/admission time. Uniform `Had64` passed both 3-check and 4-check OOD gates on Gemma-4 offline, while the earlier mixed `Had128/Had64` layout failed OOD chat for both calibration variants.
+- **Live serving trade-offs on 1x B70 (`vllm/vllm-openai-xpu:v0.31.0`):**
+  - Dense `Qwen3.8-27B`: `1.28x` faster 8K prefill (`2,364` vs `1,849 tok/s`), `1.26x` faster 32K prefill (`2,054` vs `1,634 tok/s`), `-10.7%` energy at 32K, flat 329-item live battery (`287` vs `283`, `p=0.48`), trading off `10% to 12%` slower single-user decode. Under `Exp 22` (`FP8` KV, `8K -> 128K`), faster prefill wins full cold turns in wall clock AND energy from `32K` through `128K` (see `kv-and-context.md` §5).
+  - Multimodal MoE `Gemma-4-26B-A4B-it` (`14.64 GiB` weights, `Exp 21` quiet host `230 W / 2,800 MHz`, `52–55 C`, `n=3`, model-card sampling): **`84.76 tok/s`** (51 tok, `1.987 J/tok`), **`70.80 tok/s`** (2K, `1,252 tok/s` prefill), **`55.60 tok/s`** (8K), `8/8` canaries + vision PASS, live vs offline WT2 PPL `25.983` vs `25.982`.
+
+### 5.3 `BiasCorr` (`b = -ΔW · E[x]`): Scaling Laws, Ultra-Low-Bit Split & Mandatory Negative Controls
+- **Mechanism & Pos0 exclusion:** Weight rounding shifts per-channel output means by `(W - W_hat) * E[x]`. Always exclude token position `0` (`X[:, 1:, :]`, attention-sink outlier; including `pos 0` degraded `NVFP4` OOD KL by `+29%`). Fuse FP32 bias into the GEMM/SwiGLU/GeGLU epilogue immediately after DPAS before FP16 rounding — never ship a standalone bias kernel (`-9.5%` tax -> **`<= +0.30%` TTFT overhead `0–128K`** on quiet-host TensorFold patch v5, with **`11/11` `drafted == serial`** on GPU0 and `--tp 2`).
+- **All-496-linear `mean_x` cosine mechanism:** Post-RMSNorm input projections have universal means across domains (`cos = 0.913–0.931`), whereas post-SwiGLU output projections (`mlp.down_proj`, `cos = 0.153–0.191`) are strongly domain-specific. Calibrate on disjoint general prose + code (and chat-formatted mix for instruct models) with logged token-ID SHA-256 and `0/0` 6-gram overlap.
+- **MoE `shared_only` scaling law:** On 128E–256E MoEs (`Gemma-4-26B`, `Qwen3.6-35B`), a **`2.0–2.54 MiB` `shared_only`** sidecar matches a `122.5 MiB` `all_experts` sidecar (`48x` smaller; `-36.7% / -22.2% / -29.4%` WT2/Code/OOD on `Qwen3.6-35B`) because routed experts see too few tokens under small calibration sets.
+- **Mandatory 4-check gate ON SERVED GPU KERNELS (never trust simulated math alone!):** Require (1) WikiText-2 KL 95% block-bootstrap CI `< 0`, (2) Code KL CI `< 0`, (3) held-out OOD chat KL CI `< 0` for instruct models, and (4) reversed-sign `-b` control strictly worse. **`Exp 21` proof:** converter `--cal-chat-template` default passed simulated math on Code (`[-0.05385, -0.00723]`) yet missed on actual served GPU kernels (`[-0.04884, +0.00073]`) -> rejected (`publishable: false`). Always gate on the exact served kernel path!
+- **Regime split across bit widths (`Exp 18` & `Exp 20`):**
+  - **4-bit & 3-bit:** Cuts KL drift (`-14%` to `-37%` across Qwen3.8 / Qwen3.6 / Gemma-4; transfers zero-shot to Spanish Wikipedia `-17.1% / -19.0%`, Don Quixote `-12.7% / -22.6%`, and `2,048 / 4,096` context `-14.5%` to `-20.6%`), while **total binary task scores stay flat** (at 3-bit `1,024`-token cap, plain GSM8K scores `58/60` vs `57/60` corrected, `p=1.0`, exposing an earlier 384-cap `41 -> 48` reading as a truncation artifact!).
+  - **2-bit (`2.26 bpw` `had_int2_g16`):** Genuine statistically decisive task rescue — a single `14.89 MiB` open-loop `BC_open` vector lifted `Qwen3.8-27B` from **`31 -> 93/160` (`72/10`, `p = 1.0e-12`)**, GSM8K **`8 -> 50/60` (`42/0`, `p = 4.5e-13`)**, untruncated GSM8K `6/17 -> 15/17` (`p = 0.0039`), and WT2 PPL `65.2 -> 20.3` (still well below 3-bit `122/160`). Simple open-loop `BC_open` beat sequential closed-loop `BC_closed` in **`6/6`** ultra-low-bit formats.
+- **Mandatory Negative Controls (NEVER apply `BiasCorr` blindly!):** Open-loop `BiasCorr` actively **HURTS** models whose weights already compensate for quantization or use post-norm / incompatible scaling:
+  - Calibrated `GPTQ-Int4` (`+5.7%` WT2 KL)
+  - Trained/QAT ternary `prism-ml/Ternary-Bonsai-2-27B` (`0.653 -> 1.507` weight-diff, `2.112` open act, `9.317` closed act — note Bonsai-2 itself crushes PTQ ternary `2.689` and corrected 2-bit `1.138`, while trailing corrected 3-bit `0.271`)
+  - Post-norm `OLMo-2-7B` (`+92%` to `+211%`), `Llama-3.2-3B` (`+17%` to `+43%`), `SmolLM2-1.7B` (`+18%` to `+51%`), `Phi-4-mini` (`+3%` to `+24%`), and `Granite-4.0-h-tiny` `HF-G16` arm.
+
+### 5.4 Cross-Hardware Generality Boundary (Portable Math vs Xe2-Specific Speed)
+- **100% Universal (NVIDIA, AMD, Intel, Apple MLX, CPU/NPU):** Pos0-excluded `BiasCorr` + fused epilogue (`~0%` cost), `shared_only` MoE sidecars, 2-bit open-loop rescue, `HF-INT4-G16` quality-per-bit, `V > K` sensitivity (`11/12`), and plain rotated 3-bit KV beating 1-bit QJL (`3.13x`).
+- **Uniquely Valuable on Xe2 (Arc Pro B70), Ampere (SM80), RDNA3 & INT8-Only NPUs/CPUs:** Zero-unpack `W4A8-INT8` unlocks the *only* `2x` hardware prefill multiplier on silicon that has `2x` INT8 matrix throughput and **no native FP8/FP4 matrix units**.

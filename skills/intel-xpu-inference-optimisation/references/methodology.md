@@ -53,3 +53,42 @@ Never ship a 256K–512K quantized KV pool on capacity alone — verify that qua
 1. **Matched BF16 vs quantized KV held-out perplexity:** Build a strictly held-out natural technical prose evaluation slice (`256` tokens, excluded from the prefix corpus) conditioned on `4K, 32K, 64K, 128K, 245K` (and ultra-deep `384K, 496K` beyond BF16's VRAM ceiling). Score via `/v1/completions` with `echo=True, logprobs=1, max_tokens=1, temperature=0` and report `NLL`, `PPL`, `ΔPPL (%)`, and per-token `logprob MAE`.
 2. **Dual-needle recall spanning oldest + middle KV:** Bury two unique keys at **`~15%` depth (oldest KV entries)** and **`~55%` depth (middle KV)** inside real prose/code up to the maximum usable context (`245K` and `496K`) and verify **`2/2` exact recall**. For reasoning models, set `max_tokens >= 384` (never `128`, which can saturate `<thinking>` and return empty `content=""`).
 3. **Check architecture-level KV bounds:** Check whether the model normalizes/clips K & V before KV storage (e.g., Inkling 2 L2-clips K and RMSNorms V right before KV write, which kept FP8 KV within `-0.48%..+0.41%` PPL of BF16 through `245K`, `3.58` PPL at `496K`, and `2/2` exact recall at `495,964` tokens). Never generalize that result blindly to standard unclipped transformers without re-measuring!
+
+
+## 6. Adversarial Forensic Review Posture & 13-Point Audit Checklist (v3.9.0)
+
+Before declaring any quantization study, kernel patch, or benchmark ready for publication or upstream PR, run an independent adversarial review (or self-audit) with **this exact forensic attitude** — distilled from 10 rounds of cross-model peer review on the B70 27B quantization study:
+
+### Forensic Review Attitude
+1. **Treat every prose claim as guilty until verified against raw JSON receipts, tensor headers, and live `file:line` source.** Never trust a previous pass's summary table.
+2. **Zero cheerleading, zero softening.** Lead with the exact verdict and a numbered table of concrete defects (`file:line`, receipt key, severity `HIGH/MEDIUM/LOW`).
+3. **Tag provenance strictly and write `unexplained` when a cause is unmeasured.** Separate `[THEOREM]`, `[LIVE]`, `[HISTORICAL]`, `[INFERRED]`, and `[UNTESTED]`. Never invent a plausible story for an anomalous dip (e.g., `mlp_down M=512` `0.92x` stayed `unexplained` even after 8 kernel variants failed to beat oneDNN).
+4. **Hunt two-variable confounds relentlessly.** If a prototype changed two things at once (e.g. separate bias kernel + disabling fused `ngen_swiglu`, or `bf16` bias on W4A16 vs `fp32` bias on W4A8), reject attribution immediately.
+5. **Demand adversarial null controls, not just positive wins:**
+   - **Sign-flipped control (`-b`):** must catastrophically *worsen* KL (verified: `+84.0%` WT2, `+68.7%` Code, DNR drops `8/8 -> 5/8`).
+   - **Matched-L2 random-direction control (`>= 3` seeds):** must *worsen* KL (verified: `+28.5–35.0%`).
+   - **IEEE `-0.0f` zero-bias path control:** must match `NULL` **`100%` SHA-256 bit-for-bit** across every depth and prompt.
+   - **Disjoint calibration corpora:** log exact corpus file list, token-ID SHA-256, and measured 6-gram overlap (`0/0`).
+6. **Audit silent fail-open paths and whole-repo blast radius.** Grep every caller of every modified kernel across other model families, reference verifiers, quantization loaders, and argument binders.
+
+### 13 Real Failure Classes Caught by Adversarial Audit (Check Every Time)
+
+| # | Failure Class Caught | Mandatory Prevention Rule |
+|---|---|---|
+| 1 | **Silent fail-open sidecar load** (printed "loaded" before checking if any key matched) | Track every loaded key (`BiasTracker`); fail closed (`rc != 0`) on any unused/missing key + add a negative test. |
+| 2 | **Reference oracle silently dropping new math** (`fp64_ref` overwrote output without bias) | Update FP64/FP32 verification oracles in the exact same patch as the GPU kernel. |
+| 3 | **Unsupported quant paths silently ignoring opt-in state** (`W4A8`/`W4A4`/`GPTQ`) | Assert `bias == null` or return an explicit error on every path that does not implement the feature. |
+| 4 | **Stale OpenCL kernel args on trailing signature change** (`Dev.launch` sets args by index) | Enforce `CL_KERNEL_NUM_ARGS` arity assertions (`kernelArgs`) at kernel init time. |
+| 5 | **Cross-family blast radius** (shared zebins/macros broke another model family's callers) | Grep the entire repo for every touched kernel/macro symbol and update all callers (e.g. Gemma 4). |
+| 6 | **Two-variable prototype confound** (`add_bias_f16` also disabled fused `ngen_swiglu`) | Fuse into the epilogue so only one variable changes; never publish prototype speed as feature cost. |
+| 7 | **Proxy-vs-shipped checkpoint gap** (re-quantized proxy showed `-12.9%` Code KL while shipped checkpoint was a `-2.77%` null) | Never transfer proxy CIs onto shipped checkpoints; re-measure on the exact shipped artifact. |
+| 8 | **Rank-1 DC Mean Trap in uncentered SQNR** (`91–95%` energy in a constant DC vector inflated total SQNR to `34 dB`) | Retire uncentered SQNR; require centered SQNR + full-depth `KL(P_ref || P_Q)` + `blk32` 95% CIs. |
+| 9 | **Clock drift & impossible timer algebra** (`2050 vs 2750 MHz` across sessions; `core + FWHT > e2e` by `38–76 us`) | Log `act_mhz`, `temp`, `power_w` per cell; run alternating `b1 -> cand -> b2`; reject runs where `parts > total`. |
+| 10 | **Marginal vs wall-clock cost confusion** (`+10.5 s` in-harness vs `229 s` real standalone export) | Report both marginal compute and end-to-end wall-clock artifact generation time. |
+| 11 | **Constant/citation drift** (`456` B580 vs `608 GB/s` B70; `0.004` vs `0.0051 bpw`; wrong DNR ID) | Recompute every constant directly from hardware specs, safetensors headers, and ledger files. |
+| 12 | **Calibration provenance & shingle overlap** (unpinned 2.6 KB docs slice overlapped eval prompt) | Pin calibration corpus with token-ID SHA-256 and verified 6-gram overlap; use disjoint general text/code. |
+| 13 | **Local host hacks & private leaks in diffs** (`build/xpu.zig` compiler workaround, `/data/...`, PCI IDs) | Keep host workarounds out of feature patches; scrub all private paths/PCI IDs before publishing. |
+| 14 | **Token-cap truncation artifacts** (`384`-tok GSM8K looked like `41 -> 48`, vanished at `1,024` tok `58 -> 57`) | Always run math/reasoning checks at `>= 1,024` tokens and report untruncated subsets separately. |
+| 15 | **Simulated-math vs served-kernel gating gap** (`Exp 21` passed simulated math, failed served kernel by `+0.00073`) | Pre-register that the actual served GPU kernels decide pass/fail; never ship a sidecar gated only on simulated math. |
+| 16 | **Decode-only metric distortion** (judging a `-10%` decode format without `TTFT + decode` turn time) | Report end-to-end turn wall clock (`TTFT + reply`), `J/turn`, and break-even output length across `8K -> 128K`, and separate cold vs warm prefix-cached regimes. |
+| 17 | **Overstating internal AI audits as peer review** | Explicitly disclose single-author single-workstation scope; never call AI-agent audits "human peer review", and never rewrite frozen receipt evidence to satisfy prose-hygiene filters. |

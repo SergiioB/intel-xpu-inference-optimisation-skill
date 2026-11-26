@@ -64,7 +64,20 @@ Only write or modify GPU kernels after (1) config/engine levers plateau, (2) pro
 
 ---
 
-## 3. Mandatory Kernel Verification Checklist
+## 3. Device-Side Graph-Safe Grouped MoE Prefill & Fail-Closed Admission (`vllm-hf-int4-g16-xpu v0.2.0`, v3.9.0)
+
+- **Pair vs grouped MoE crossover (`432` quiet-host cooled samples, `M = 1..512`):**
+  - Keep the low-overhead pair dispatch path for small `M` (`M = 1..16`; at `M=16`, Qwen eager grouped dipped to `0.903x` pair).
+  - Switch to **device-side histogram -> prefix scan -> token scatter -> grouped W4A16 GEMM** (zero host sync, zero host sort, XPU-graph-safe, bit-exact vs pair!) from `M >= 32` onward: **`3.41x` eager / `3.52x` graph** faster on `Gemma-4-26B` (`128E`) and **`3.27x` / `3.46x`** on `Qwen3.6-35B` (`256E`) at `M=512`.
+  - Across `M = 8..64`, packed 4-bit beats stock BF16 by **`1.48x–2.06x` eager** and **`2.18x–2.73x` graph replay**. At `M=512`, BF16 still beats W4A16 packed (`3.97` vs `7.17 ms` Gemma; `3.36` vs `4.59 ms` Qwen) until DPAS Step B grouped MoE prefill lands.
+- **Mandatory fail-closed Xe2 2D block-I/O & MoE admission invariants:**
+  1. Validate **effective q-pack base 64-byte alignment**, legal 2D block width/pitch/surface geometry, and `N >= 16`, `N % 16 == 0` (safe fallback under `auto`, hard fail under forced native).
+  2. Reject empty expert banks (`E == 0`), validate `int64` routing IDs before narrowing to `int32`, and assert `processed == admitted` before first forward so missing expert banks can never silently fall through to uninitialized BF16 weights.
+  3. Never encode raw-bank provenance as a spoofable string prefix (e.g. `"block_sparse_moe:"`) — use a typed key `tuple[bool, str]` (`is_raw_bank, member_name`) and cover it with a negative spoofing unit test!
+
+---
+
+## 4. Mandatory Kernel Verification Checklist
 
 Before running a full benchmark with any new/modified Xe2 kernel:
 1. **Unit parity vs exact FP32/FP64 reference** across every row count `M` served (`M = 1, 2, 4, 8, 16, 64, 512, 2048`) AND edge-case scales (including E4M3 subnormals, zero rows, masked padding tokens).

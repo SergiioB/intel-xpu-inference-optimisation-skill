@@ -75,3 +75,23 @@ A huge architectural insight measured on B70 (`q8_0 K / q4_1 V`):
   - `vLLM XPU` W4A16 / speculative stacks: **OFF (`--no-enable-prefix-caching`)** until upstream `#53912`-class cache corruption is fixed and proven clean with a multi-turn corruption check.
   - `exl3xpu` & `TensorFold`: **ON** for interactive chat; explicitly declared and verified `0` cache-hit delta for cold prefill benchmarks.
 - **One decode cell is NOT a long-context verdict (`SESSION-STABILITY.md`):** Run a multi-turn session trace (e.g. 11 turns seeded at `118K–131K`) and measure decode sag across turns (`Ripple-65B` 2-card 118K: `0.0%` sag; `Qwen3.8-27B` `q8_0` KV 131K: `-0.5%` sag; cached TTFT `0.6–9 s`). Flag any memory growth (e.g. OpenVINO INT4 `>= 196K` `CL_OUT_OF_RESOURCES`).
+
+---
+
+## 5. Plain Hadamard-Rotated 3-Bit KV vs TurboQuant 1-Bit QJL & `8K -> 128K` End-to-End Turn Scaling (v3.9.0)
+
+### 5.1 Plain Rotated Scalar `K3V4 / K3V3` Beats TurboQuant-Style 1-Bit QJL by `3.13x / 2.65x` (`Exp 19A`)
+- **Measured on `Qwen3.8-27B` (`head_dim = 256`, 256-dim FWHT rotation, matched bit budget):**
+  - Spending 1 bit on a random 1-bit QJL residual sketch **worsened** combined KL by **`3.13x`** at 3.5 bits (`0.0529` QJL vs `0.0169` plain rotated `K3V4`) and **`2.65x`** at 3.0 bits (`0.0640` vs `0.0242` plain rotated `K3V3`), even after the QJL sketch passed its own unbiasedness self-test!
+  - **Mechanism:** At `3–4` bits, the random projection injects far more estimator variance than its bias removal saves. Put every available bit into plain Hadamard-rotated scalar quantization instead.
+  - **Additive weight + KV stacking:** Stacking rotated `K3V4 / K3V3` on top of `HF-INT4-G16 + BiasCorr` weights produces `93%–98%` of the sum of separate errors (near-perfect additivity). By memory arithmetic (calculated projection excluding runtime work buffers, not a live 256K run yet), `256K` `Qwen3.8-27B` context drops from `33.0 GiB` BF16 KV (OOM on 32 GiB) to **`3.06–3.56 GiB` KV (`20.0–20.5 GiB` total)** on 1x B70.
+
+### 5.2 Why Decode `tok/s` Alone Misleads: Live `8K -> 128K` End-to-End Turn Scaling (`Exp 22`)
+- Measured live on 1x quiet B70 (`vllm/vllm-openai-xpu:v0.31.0`, `FP8` KV, `230 W / 2,800 MHz`, `<= 55 C`, `ABABAB`, `n=3`, `256` output tokens, `6/6` hidden-needle PASS at `64K` and `128K`):
+  - **`8K`:** `HF-G16-BC` `12.77 s` vs `GPTQ` `12.64 s` (`0.990x`, TTFT is `28.6%` of turn; break-even `~225` out tokens).
+  - **`32K`:** **`HF-G16-BC` `28.92 s` vs `GPTQ` `31.18 s`** (`1.078x`, **`+2.25 s` faster, `-7.0%` energy**, TTFT `66.4%`; break-even `~791` out tokens).
+  - **`64K`:** **`HF-G16-BC` `61.38 s` vs `GPTQ` `65.89 s`** (`1.073x`, **`+4.51 s` faster, `-6.7%` energy**, TTFT `82.9%`; break-even `~1,292` out tokens).
+  - **`128K`:** **`HF-G16-BC` `163.87 s` vs `GPTQ` `169.23 s`** (`1.033x`, **`+5.36 s` faster, `-3.0%` energy**, TTFT `92.7%`; break-even `~1,455` out tokens).
+- **Two critical scaling lessons:**
+  1. **Evaluate cold long-context routes on end-to-end turn time (`TTFT + reply`) and `J/turn`, not decode `tok/s` alone.** A controlled `~10%` decode cost is paid back with interest on every cold `32K–128K` RAG/coding/agent turn up to `~791–1,455` output tokens.
+  2. **Prefill speedup narrows at `128K` (`+25.1%` at `8K` -> `+4.2%` at `128K`)** as quadratic `O(L^2)` attention overtakes linear `O(L)` weight GEMMs — and on *warm prefix-cached* multi-turn agents (short delta prefill), decode speed dominates again so `GPTQ` retains its `~10%` decode edge.
