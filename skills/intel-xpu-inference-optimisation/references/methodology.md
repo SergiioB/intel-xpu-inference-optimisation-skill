@@ -92,3 +92,37 @@ Before declaring any quantization study, kernel patch, or benchmark ready for pu
 | 15 | **Simulated-math vs served-kernel gating gap** (`Exp 21` passed simulated math, failed served kernel by `+0.00073`) | Pre-register that the actual served GPU kernels decide pass/fail; never ship a sidecar gated only on simulated math. |
 | 16 | **Decode-only metric distortion** (judging a `-10%` decode format without `TTFT + decode` turn time) | Report end-to-end turn wall clock (`TTFT + reply`), `J/turn`, and break-even output length across `8K -> 128K`, and separate cold vs warm prefix-cached regimes. |
 | 17 | **Overstating internal AI audits as peer review** | Explicitly disclose single-author single-workstation scope; never call AI-agent audits "human peer review", and never rewrite frozen receipt evidence to satisfy prose-hygiene filters. |
+| 18 | **Trusting clean theorems without a 20-line real-shard check** (both "`u <= 4` row-coupling collapse" and "centered GPTQ + BiasCorr is orthogonal" sounded airtight in prose yet failed on real weights/held-out activations) | Before proposing a new format or kernel rewrite, run a read-only Python probe on real checkpoint shards and held-out activations. |
+| 19 | **Global 256-GRF compilation on memory-bound decode kernels** (forcing `-ze-opt-large-register-file` onto every kernel halved EU occupancy and turned `N=5120` decode into 1.25 waves) | Compile decode/GEMV/actq kernels in a separate **128-GRF** zebin; reserve 256 GRF strictly for tall DPAS prefill tiles. |
+| 20 | **Silent fallback swallowing & default-mode cliff** (`v0.2.0` default `w4a16` silently sent all `M >= 5` batches to Triton with zero logs) | Log every backend fallback once, test with forced `BACKEND=native`, and ensure default mode matches the published benchmark table. |
+| 21 | **Hidden double-work dispatch** (`M=3` launching `M=2 + M=1` sequentially and reading weights twice; `actq` reading and rotating `x` twice) | Audit every `M` branch in the C++/Level-Zero launcher and verify exact byte/pass counts per dispatch. |
+| 22 | **Calibration sample-size overfitting cliff (`n <= K`)** (`1,024` tokens on `K=17,408` `down_proj` hit `44.7 dB` in-sample and `-1.39 dB` held-out) | Require `n_tokens >> K` (`>= 256K` mixed tokens for `K=17,408`) and always report held-out SNR/KL, never calibration-set SNR. |
+| 23 | **Host-environment calibration drift** (reading code calibration from the host's local Python stdlib changes the sidecar across Python versions) | Pin calibration corpora as immutable versioned snapshots with logged SHA-256; never read live system libraries. |
+| 24 | **First-shape TTFT stalls hiding inside concurrency aggregate rates** (an `8 s` first-shape stall masked clean `C=4` per-request `-34.7%` as `-29%` aggregate) | Always report per-request steady-state `ms/step` and clean post-warmup reps alongside aggregate tok/s. |
+
+---
+
+## 7. Adversarial Investigation & Multi-Model Swarm Protocol (How to Falsify Before Building — v3.10.0)
+
+This playbook distills the exact mindset and workflow that turned a broad "should we design a better format/rotation?" inquiry into concrete, zero-format-change V1 breakthroughs:
+
+### 7.1 The Investigation Attitude (6 Rules That Beat Guesswork)
+1. **Challenge the user's and your own brief first.** Start every report with a "Corrections to the Brief" table (`[SOURCE-VERIFIED]` / `[MEASURED]`). If a suspected bottleneck (`u <= 4` row-coupling, `K <= 17,408` overflow, `M=8` using a 64-row prefill tile, or `G16` scale bytes explaining `C=1` decode) is false in the code or real shards, say so immediately before designing fixes for phantom problems.
+2. **Never trust prose theory over a 20-line real-weight probe.** Pure math can prove in-sample bounds (e.g., centered GPTQ minimizes `E||DeltaW x - b||^2` in sample) while completely missing the out-of-sample dominant effect (per-token mean scaling shift `DeltaW * mu_hat * a_t`, where uncentered GPTQ beat centered+BC in `11/12` held-out cells!). Always validate mathematical conjectures on real checkpoint tensors + held-out activations before proposing a new format.
+3. **Price the silicon ceiling BEFORE proposing format changes.** Count exact safetensors header bytes per token, divide by measured copy bandwidth (`540.8 GB/s`), and decompose the live `ms/step` gap into (a) irreducible format bytes vs (b) kernel/occupancy/dispatch inefficiency. Only consider a new format (Format V3) if the existing bit container has provably exhausted both converter optimization and kernel efficiency.
+4. **Enforce strict provenance tags on every number:**
+   - `[THEOREM]` — algebraic/bit-level proof (e.g., `K <= 132,104` int32 bound, Welch $\ell_\infty$ optimality of $H_B$, forced `u in {1..16}`).
+   - `[SOURCE-VERIFIED]` — directly read from exact `file:line` or safetensors header.
+   - `[MEASURED-RECEIPT]` — reproduced from a pinned JSON receipt.
+   - `[MEASURED]` — run live in a read-only probe script (with exact sample size, layers, and seed disclosed).
+   - `[HYPOTHESIS-UNTESTED]` — any projected tok/s or end-to-end KL gain not yet measured on the target GPU.
+   - Always include an explicit **"Limits / Not Tested / Confounds"** section naming every untested assumption (`GPU0` vs `GPU1`, clock drift, eager vs graph dispatch).
+5. **Kill your darlings fast with explicit numeric Kill Criteria.** Every proposed experiment must state its **Pass Gate** AND **Kill Gate** upfront (e.g., *"Test Full-$H$ GPTQ on `L3` + `L40` `down_proj` at `256K` tokens first; kill if held-out SNR over `RTN+BiasCorr` is `< +1.0 dB`"* or *"Test pre-expanded int8 weights in the tall prefill kernel for 1 hour to separate unpack ALU from 16x A-tile re-reads"*).
+6. **Always separate Improvements in Weights/Converter vs. Improvements in vLLM/Kernels.** Never mix a converter change and a kernel change in the same A/B arm; ship bit-exact kernel wins first (zero quality risk), then quality-changing kernel/converter wins behind full KL + exact-answer gates.
+
+### 7.2 Multi-Model Adversarial Swarm Pattern (Zero-Overlap Partitioning)
+When auditing a complex quantization + kernel stack, partition the problem into orthogonal read-only tracks with complementary roles and cross-examine contradictions:
+- **Fast/Free Forensics Workers (line-by-line code, header & ledger census):** Partition cleanly by subsystem (quantizer/converter, decode kernels, prefill DPAS/Triton, layer-by-layer receipt anatomy, full `Exp`/`DNR` chronicle continuity, vLLM plugin/graph dispatch). Keeps zero dead ends repeated and grounds every `file:line`.
+- **Pure-Math Specialists (bounds & transforms):** Derive exact rate-distortion, coherence/Welch bounds, orthogonal/complex transform limits, and algebraic foldability across hybrid blocks (e.g., Gated DeltaNet + gated attention).
+- **Systems & Microarchitecture Architects (rooflines & kernel designs):** Build per-op `ms/step` budgets, spot hidden routing/fallback cliffs, and propose concrete XMX/DPAS/GRF kernel architectures.
+- **Adversarial Empirical Reviewers (ruthless refutation):** Explicitly tasked to **attack every claim in the brief and other tracks** using real-shard Python probes, raw safetensors headers, and raw JSON receipts — killing every attractive idea whose measured delta is `< 0.2 dB` or physically capped by silicon bandwidth.

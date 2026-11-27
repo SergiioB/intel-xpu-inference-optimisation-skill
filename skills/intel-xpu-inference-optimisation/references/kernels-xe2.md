@@ -77,6 +77,26 @@ Only write or modify GPU kernels after (1) config/engine levers plateau, (2) pro
 
 ---
 
+### 3.1 Dense `HF-INT4-G16` Decode/Prefill Forensics: GRF Split, Small-M DPAS & Prefill A-Tile Ceiling (v3.10.0)
+
+Forensic audit of dense `HF-INT4-G16` OpenCL/Level-Zero kernels on B70 (`608 GB/s` pin, `540.8 GB/s` copy, `586 GB/s` best oneDNN BF16 GEMV read stream, `32` Xe-cores, `SIMD16`) uncovered why `C=1` decode trailed stock `GPTQ-G128` by `4.00 ms/tok` (`29.48` vs `33.42 tok/s`), `C=4` trailed by **`-34.7%` per request** (clean reps: `20.02` vs `30.66 tok/s/req`), and `C=8` trailed by **`-23.5%` per request** (`21.42` vs `27.99`), even though extra `G16` scale bytes account for only **`0.55–0.75 ms` (`~0.7 tok/s`)** at `C=1`:
+
+1. **The 256-GRF Occupancy Trap (Always Split Decode vs. Prefill Zebins!):**
+   - Compiling *every* kernel with `-ze-opt-large-register-file` (256 GRF) halves EU thread occupancy (4 vs 8 threads/EU). On `N=5120` projections (`mlp_down`, `out_proj`, `o_proj`), a `160 WG x 8 SG` decode grid executes as **1.25 waves** instead of `0.625` waves, causing `44–55%` of the entire decode gap (`mlp_down` dropped to `445 GB/s` vs `518 GB/s` on `mlp_up`).
+   - **Rule:** Ship **two zebins** — compile memory-bound decode, small-M `sk4`, and `actq` kernels at **128 GRF** (verifying zero spill on `m4`), and keep only register-heavy tall DPAS prefill tiles at **256 GRF**.
+2. **Never Use Broadcast-FMA Decode Above `M=1` — Move `M=1..32` Decode onto XMX DPAS:**
+   - The fused W4A16 decode kernel recomputes FWHT-128 inside every 32-column workgroup for every row `m` (`~352x` logical FWHT redundancy across a full decode step) with FP32 FMAs growing linearly in `M`, making `M=4` W4A16 slower per token than `M=8` W4A8 DPAS (`49.95` vs `46.69 ms/step`).
+   - **Two XMX DPAS designs for `M=1..32` (same V1 packed weights, eliminating the `M=4 -> 5` precision cliff and unlocking strict MTP verification):**
+     - **W4A16-on-DPAS:** Keep FP16 rotated activations after a shared single-pass FWHT; SWAR-unpack `(q - 8) * u` exactly into FP16 and run FP16 XMX DPAS (`M=1..32` flat latency curve, requires KL + `DNR-009` parity gate).
+     - **Digit-DPAS W4A16:** Run one shared FWHT (FP32), split each row into `D=2` (16-bit, `±32.6K` levels) or `D=3` (23-bit) balanced signed 8-bit digits placed into **spare DPAS M-rows** (`M=4 x D=2 = 8` rows = 100% XMX row utilization!), SWAR-unpack exact int8 `(q - 8) * u` once, run `intel_sub_group_i8_i8_matrix_mad_k32`, and recombine `sum acc_j * 256^(D-1-j)` in the FP32 epilogue (`[THEOREM]`: exact int8 weights, int32 cannot overflow for `K <= 132,104`, **100% M-invariant** integer accumulation!).
+3. **Eliminate Pathological Dispatch & Redundant Passes:**
+   - **Never split `M=3` into `M=2 + M=1`:** Launching both sequentially reads the entire weight matrix **twice** (fatal for `MTP k=2` verification). Implement a native `m3` kernel or unified DPAS tile.
+   - **Single-pass in-register `actq`:** Never read `x` twice and compute FWHT twice inside `fused_fwht_actq`; hold rotated blocks in registers (`~+2%` free prefill).
+   - **Tiny-N grid starvation (`in_proj_ba`, `N=96`):** Launching 3 workgroups across 32 Xe-cores 48 times/token is pure latency overhead; fuse into `qkvz` (`N=16,480`) or keep dense.
+4. **Prefill `58%` TOPS Ceiling Diagnostic (`142–172` vs `270–288 TOPS` oneDNN INT8):**
+   - Before rewriting the prefill kernel, run a **1-hour decisive diagnostic**: feed pre-expanded `int8` weights directly into the existing tall W4A8 DPAS kernel. If throughput jumps to `>= 250 TOPS`, weight unpack ALU is the bottleneck; if it stays at `~170 TOPS`, **16× redundant A-tile reads across subgroups** in the workgroup are the bottleneck — fix via SLM-shared A staging or a 32-column subgroup tile (projected `+28–30%` prefill, pushing end-to-end prefill from `1.28x` toward `~1.7–1.8x` over stock W4A16).
+
+
 ## 4. Mandatory Kernel Verification Checklist
 
 Before running a full benchmark with any new/modified Xe2 kernel:

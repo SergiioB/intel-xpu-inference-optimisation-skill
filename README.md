@@ -30,13 +30,13 @@ skills/intel-xpu-inference-optimisation/
 │   ├── field-manual-and-case-study.md                      # Complete Xe2 mental model, 8 habits, troubleshooting tree & full Inkling 2 Mini case study
 │   ├── workflow-and-intake.md                              # Start here: 5-phase Day-0 intake, external-repo audit, op decomposition, kernel iteration & shipping
 │   ├── ceilings.md                                         # Xe2 silicon datapaths (XMX FP16/INT8/INT4, 16B align), looped/MoE/SWA & P2P ceilings
-│   ├── quantization.md                                     # 6 quant axes, format showdown (NVFP4/EXL3/MLX/AutoRound/GGUF/IQ/FP8), drafter economics
+│   ├── quantization.md                                     # 6 quant axes, 12-family HF-INT4-G16/BiasCorr study, v3.10.0 V1 bounds, 7 killed dead ends & full-H GPTQ vs vLLM ranking
 │   ├── kv-and-context.md                                   # K/V KL-divergence table (q8_0 vs q4_0 K cliff), 3.8x dense-vs-MoE KV, SWA mbt, 11-turn sag
 │   ├── engines-and-topology.md                             # 6-engine capability matrix, 150W MoE vs 180W/230W Dense power sweet spots, dual-B70 TP2
-│   ├── kernels-xe2.md                                      # AOT bmg_g31 CUTLASS/SYCL/ESIMD patterns, 16B alignment, why megakernels/SLM staging fail
+│   ├── kernels-xe2.md                                      # Dual-zebin 128/256-GRF law, small-M DPAS/Digit-DPAS, AOT CUTLASS/SYCL/ESIMD, grouped MoE & closed Xe2 patterns
 │   ├── levers.md                                           # Workload regime matrix + 15 ranked B70 levers across all 5 engines & 8+ models
 │   ├── gotchas.md                                          # All 42 closed failure classes (DNR-001..042) & Intel XPU/SYCL/driver/profiling traps
-│   ├── methodology.md                                      # 3-class correctness-lane framework, card sampling, energy, VRAM & retrieval gates
+│   ├── methodology.md                                      # 3-class correctness lanes, 24-point forensic audit checklist, multi-model adversarial swarm & falsification protocol
 │   └── publishing.md                                       # Pinning, opt-in gating, sanitization, cookbook CI & 2x PIL result graphics
 ├── scripts/
 │   ├── b70_preflight.py                                    # Read-only Intel GPU / VRAM / power / RAM preflight

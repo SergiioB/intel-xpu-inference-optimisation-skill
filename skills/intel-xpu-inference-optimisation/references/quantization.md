@@ -99,3 +99,42 @@ Full 12-family empirical study (`Qwen3.8-27B`, `Gemma-4-26B-A4B`, `Qwen3.6-35B-A
 ### 5.4 Cross-Hardware Generality Boundary (Portable Math vs Xe2-Specific Speed)
 - **100% Universal (NVIDIA, AMD, Intel, Apple MLX, CPU/NPU):** Pos0-excluded `BiasCorr` + fused epilogue (`~0%` cost), `shared_only` MoE sidecars, 2-bit open-loop rescue, `HF-INT4-G16` quality-per-bit, `V > K` sensitivity (`11/12`), and plain rotated 3-bit KV beating 1-bit QJL (`3.13x`).
 - **Uniquely Valuable on Xe2 (Arc Pro B70), Ampere (SM80), RDNA3 & INT8-Only NPUs/CPUs:** Zero-unpack `W4A8-INT8` unlocks the *only* `2x` hardware prefill multiplier on silicon that has `2x` INT8 matrix throughput and **no native FP8/FP4 matrix units**.
+### 5.5 `HF-INT4-G16/1` Mathematical Bounds, Killed Dead Ends, Full-$H$ GPTQ & Weights-vs-vLLM Ranking (v3.10.0)
+
+Deep mathematical and real-shard verification of `Had128NoPerm + HF-INT4-G16` (`4.2603 bpw` with `BiasCorr`, `4.2551 bpw` without; `q in [-8..+7]`, `u in {1..16}`, `125` unique integer levels in `[-128..+112]`, all `125` realized on `Qwen3.8-27B`) proved that **the V1 bit container already sits within `0.01 dB` of its weight-MSE optimum** — meaning both the largest quality gains and the largest speed gains live **inside the existing V1 format**, not in inventing a new format:
+
+#### Proven Format Theorems & Real-Weight Bounds
+- **Gaussian equivalence after `Had128NoPerm` (`[MEASURED]` + `[THEOREM]`):** Real `Qwen3.8-27B` weights quantize to **`22.12–22.14 dB`** after `Had128`, matching i.i.d. $\mathcal{N}(0,1)$ noise (`22.11–22.13 dB`) under the exact same quantizer. Because any orthogonal rotation of an isotropic Gaussian remains Gaussian, **no larger, global, complex, or learned rotation can materially improve W4A16 weight MSE**.
+- **Uniquely forced integer scale set (`[THEOREM]`):** Native Xe2 INT8 DPAS requires $q \cdot u \in [-128, 127]$. With $q \in [-8, 7]$, $-8u \ge -128 \implies u \le 16$. The 16 integers $\{1..16\}$ are the **only** distinct positive integers that fit; a non-uniform scale mapping can only exist as a full 256-byte 2D int8 LUT `T[u][q]` (`+0.30 dB` weight SQNR in 6 Lloyd iterations — Format V3 trade-off).
+- **Row-coupling `u` panic falsified on real shards (`[MEASURED]`):** Even on `mlp.down_proj` (`K=17,408`, 1,088 groups/row), `u_mean = 9.40–9.44`, `u <= 3` occurs in only **`0.009%`** of groups (`0.0014%` of total error), and the entire cost of 4-bit row-coupled `u` vs ideal continuous G16 scales is just **`0.37–0.39 dB`** (whereas ideal continuous G32 / FP8-G32 loses **`-0.76 to -0.81 dB`**).
+- **True INT32 accumulator bound (`[THEOREM]`):** With $|a| \le 127$ and $|q \cdot u| \le 128$, worst-case dot product is $16{,}256 K < 2^{31}-1$ for **`K <= 132,104`** (not `17,408` or `65,536`).
+- **Why Hadamard blinds diagonal weighting (`[THEOREM]`):** Hadamard rotation flattens the **diagonal** of the activation Hessian $H = X^T X$ toward $\operatorname{tr}(H)/K$ while preserving **100% of its eigenvalues**. That explains why diagonal-weighted `ActMSE-CD` (`Exp 15C`) gained almost nothing, whereas **full-$H$ GPTQ/LDLQ** retains the entire eigenvalue spectrum.
+
+#### 7 Attractive Dead Ends Killed (Do Not Spend GPU Hours)
+
+| Proposed Idea | Verdict | Evidence / Proof |
+|---|---|---|
+| Bigger / global / `R1` / SpinQuant / FlatQuant rotation for W4A16 | **KILLED** | `-0.12` to `+0.005 dB` weights, `<= +0.14 dB` held-out outputs (`[MEASURED]` + Gaussian invariance `[THEOREM]`). Only helps W4A8 activation crest (`+2.0% / +4.5%` KL ceiling — low ROI). |
+| Complex unitary / DFT / FFT / phase-butterfly rotation | **KILLED** | Welch / $\ell_\infty$ optimality `[THEOREM]`: real Sylvester $H_B$ already achieves global minimum coherence $1/\sqrt{B}$; real embedding $\Phi(U)$ doubles storage without lowering coherence. |
+| Per-head `R2` (V–O) rotation on gated-attention / GDN models | **KILLED** | Models with `attn_output_gate=true` apply elementwise $\sigma(\text{gate})$ right before `o_proj`, breaking $R_2$ commutativity (`[THEOREM]` + `[SOURCE-VERIFIED]`). |
+| Optimized sign vectors $s^* \in \{-1,+1\}^K$ | **KILLED** | Layer MSE spread is `0.237%` (`~0.005 dB` ceiling `[MEASURED]`). |
+| Harder `d_row` clipping or joint `(d, u, q)` coordinate descent | **KILLED** | Already uses 6 clipped ratios (`0.76..1.06`); extending to `0.40` gains `+0.006–0.014 dB`; `Exp 15C` `MSECD` KL unchanged (`0.03193` vs `0.03196`). |
+| `FP8-E4M3` G32 scales | **KILLED** | Even ideal continuous G32 scales lose **`-0.80 dB`** vs G16 (`[MEASURED]`). |
+| "Centered-Hessian GPTQ + BiasCorr is orthogonal" | **FALSIFIED OOD** | In-sample gain is `<= 0.06 dB`; **out-of-sample, uncentered GPTQ beats or ties centered+BC in `11/12` held-out cells** (up to `+1.17 dB`) because `BiasCorr` is a constant vector while uncentered GPTQ suppresses per-token mean scaling error $\Delta W \hat{\mu} a_t$ (`[THEOREM]` + `[MEASURED]`). |
+
+#### Highest-ROI Quality Lever (Zero Format Change, Zero Runtime Cost): Full-$H$ Uncentered GPTQ Inside V1
+- **Algorithm:** Keep exact V1 container (`d_row` from RTN, `u` lazily selected at each group start, `q in [-8,7]` placed sequentially via full-$H$ GPTQ error feedback with uncentered $H$, sequential closed-loop inputs).
+- **Measured L0 signal (`[MEASURED]`):** On held-out WikiText-2 + disjoint Python stdlib with `65,536` calibration tokens, `L0 in_proj_qkv` and `in_proj_z` gained **`+3.41 to +4.28 dB`** output SNR over `RTN + BiasCorr` (projected **`-25% to -45%` 64L KL** `[HYPOTHESIS-UNTESTED]`, enough to challenge or beat `TFQ3-4b` data-free inside V1!).
+- **Mandatory sample-size law (`n >> K`):** At `1,024` calibration tokens on `mlp.down_proj` (`K=17,408`), GPTQ overfits catastrophically (`44.7 dB` train SNR, **`-0.17 to -1.39 dB` held-out**). Use **`>= 256K` mixed calibration tokens** and always gate on a cheap 2-layer pilot (`L3` + `L40` `down_proj`, pass gate `>= +1.0 dB` held-out SNR over `RTN+BiasCorr`) before paying for a full 64-layer conversion.
+- **Interaction with `BiasCorr`:** After uncentered GPTQ, mean error drops to `0.2–0.3%` of total error and `BiasCorr` adds `<= 0.01 dB` per layer; re-run the 4-check served-kernel `BiasCorr` gate after GPTQ lands rather than assuming they stack.
+
+#### Master Decision Ranking: Weights/Converter vs. vLLM/Kernel Upgrades (All Inside V1)
+
+| Domain | Rank | Change | Status & Expected Impact | Pass / Kill Gate |
+|---|---:|---|---|---|
+| **vLLM / Kernel** | **1** | **Dual-zebin GRF split:** compile decode/sk4/actq at **128 GRF**, tall prefill at **256 GRF** | `[HYPOTHESIS]` **`+1.0 tok/s` (`C=1`), `+1.0–1.5 tok/s/req` (`C=4/8`)**; fixes 1.25-wave EU stall on `N=5120` | **Bit-exact** greedy SHA-256; check `m4` spill report |
+| **vLLM / Kernel** | **2** | **Small-M DPAS decode (`M=1..32` W4A16-on-DPAS or Digit-DPAS) + real `m3` + bisect `exp8a` `M=4` regression** | `[HYPOTHESIS]` **`C=4`: `+45–50%` (`20 -> ~29–30 tok/s/req`)**, **`C=8`: `+22–26%` (`21.4 -> ~26–27`)**, halves `M=3`, kills `M=4->5` precision cliff, unlocks **MTP** | Flat `M=1..32` curve + full KL & exact-answer parity gate (`DNR-009`) |
+| **Weights / Converter** | **3** | **Full-$H$ Uncentered GPTQ into V1 (`>= 256K` cal tokens, pinned corpus)** | `[MEASURED]` `+3.4–4.3 dB` L0 SNR; `[HYPOTHESIS]` **`-25% to -45%` 64L KL** (0 runtime cost) | Pilot `L3/L40 down_proj` `>= +1.0 dB` held-out; 64L DF KL `<= 0.0253` WT2 / `<= 0.1104` Code; kill if `< 10%` KL win |
+| **vLLM / Kernel** | **4** | **Fix `v0.2.0` default `w4a16 -> Triton` fallback at `M>=5`, log all fallbacks, fix false `K<=17408` guard** | `[SOURCE-VERIFIED]` Hygiene bugfixes preventing silent multi-× slowdowns | Zero silent Triton fallbacks under `HF_INT4_G16_BACKEND=native` |
+| **vLLM / Kernel** | **5** | **Single-pass in-register `actq` (`+2%` prefill) + `A8` pre-expanded int8 prefill diagnostic (`16x` A-tile re-read)** | `[HYPOTHESIS]` Up to **`+28–30%` prefill (`1.28x -> ~1.7–1.8x` vs GPTQ)** if A-tile re-reads are the limiter | If pre-expanded int8 hits `>= 250 TOPS`, fix unpack; if `~170 TOPS`, add SLM-shared A / 32-col tile |
+| **Weights (V3 opt.)** | **6** | **2D int8 LUT `T[u][q]` (`256 B/tensor`)** or **per-projection `BiasCorr` shrinkage** | `[MEASURED]` `+0.30 dB` (`T[u][q]`) or `-2% to -4%` KL (shrinkage — only if GPTQ is not adopted) | Kill `T[u][q]` if `M=1` decode regresses `> 2%` or KL win `< 3%` |
