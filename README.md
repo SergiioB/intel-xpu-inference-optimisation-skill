@@ -31,7 +31,7 @@ skills/intel-xpu-inference-optimisation/
 │   ├── field-manual-and-case-study.md                      # Complete Xe2 mental model, 8 habits, troubleshooting tree & full Inkling 2 Mini case study
 │   ├── workflow-and-intake.md                              # Start here: 5-phase Day-0 intake, external-repo audit, op decomposition, kernel iteration & shipping
 │   ├── ceilings.md                                         # Xe2 silicon datapaths (XMX FP16/INT8/INT4, 16B align), looped/MoE/SWA & P2P ceilings
-│   ├── quantization.md                                     # 6 quant axes, 12-family HF-INT4-G16/BiasCorr study, v3.13.0 V1 bounds, 7 killed dead ends, Exp 19-Full 64L V1-GPTQ (-39.3% WT2 / -30.4% Code KL) & Exp 19-Live served-kernel A/B (PPL 7.956->7.886 / 2.556->2.518)
+│   ├── quantization.md                                     # 6 quant axes, 12-family HF-INT4-G16/BiasCorr study, v3.14.0 V1 bounds, 7 killed dead ends, Exp 19-Full 64L V1-GPTQ (-39.3% WT2 / -30.4% Code KL) & Exp 19-Live served-kernel A/B (PPL 7.956->7.886 / 2.556->2.518)
 │   ├── kv-and-context.md                                   # K/V KL-divergence table (q8_0 vs q4_0 K cliff), 3.8x dense-vs-MoE KV, SWA mbt, 11-turn sag
 │   ├── engines-and-topology.md                             # 6-engine capability matrix, 150W MoE vs 180W/230W Dense power sweet spots, dual-B70 TP2
 │   ├── kernels-xe2.md                                      # Dual-zebin 128/256-GRF law, small-M DPAS/Digit-DPAS, AOT CUTLASS/SYCL/ESIMD, grouped MoE & closed Xe2 patterns
