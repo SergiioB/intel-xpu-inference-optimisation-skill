@@ -128,6 +128,26 @@ Deep mathematical and real-shard verification of `Had128NoPerm + HF-INT4-G16` (`
 - **Mandatory sample-size law (`n >> K`):** At `1,024` calibration tokens on `mlp.down_proj` (`K=17,408`), GPTQ overfits catastrophically (`44.7 dB` train SNR, **`-0.17 to -1.39 dB` held-out**). Use **`>= 256K` mixed calibration tokens** and always gate on a cheap 2-layer pilot (`L3` + `L40` `down_proj`, pass gate `>= +1.0 dB` held-out SNR over `RTN+BiasCorr`) before paying for a full 64-layer conversion.
 - **Interaction with `BiasCorr`:** After uncentered GPTQ, mean error drops to `0.2–0.3%` of total error and `BiasCorr` adds `<= 0.01 dB` per layer; re-run the 4-check served-kernel `BiasCorr` gate after GPTQ lands rather than assuming they stack.
 
+#### Deep-Layer GPU1 Verification of Full-$H$ Uncentered GPTQ Inside V1 (`Exp 19-Pilot` & `Exp 19-Pilot-B`, v3.11.0)
+Measured on GPU1 (`Qwen3.8-27B` BF16 streamed across `L0..L40`, exact `xe2_dpas_native_v1` pack/unpack round-trip `max_abs == 0.0` on every tensor, `261,632` pos0-excluded tokens with `0/0` 6-gram overlap against frozen WT2 & Code eval windows):
+- **Deep-layer gains hold across all 17 tested projections (`L0`, `L3`, `L39`, `L40`) — zero regressions, zero format/kernel changes:**
+  - `L0` (`261K`, `damp=0.01`): `+4.12` to **`+4.86 dB`** across all 5 projections (`down_proj +4.86 dB`, `gate_proj +4.71 dB`, `in_proj_qkv/z +4.52 dB`, `out_proj +4.12 dB`).
+  - `L3` (first full-attention): `self_attn.o_proj` **`+5.45 dB`** (`~3.5x` lower MSE!), `q_proj` **`+2.85 dB`**, `mlp.gate_proj` **`+2.14 dB`**, `mlp.down_proj` (`K=17,408`) **`+1.19 dB`** (`+1.25 WT2 / +1.13 Code` at `damp=0.35`).
+  - `L39` (deep full-attention): `self_attn.o_proj` **`+3.35 dB`** (`20.41 -> 23.76 dB`), `q_proj` **`+2.42 dB`**, `mlp.gate_proj` **`+1.39 dB`**, `mlp.down_proj` **`+0.69 dB`** (at `damp=0.05`).
+  - `L40` (deep GatedDeltaNet, full-alphabet stdlib): `in_proj_qkv` **`+2.26 dB`**, `out_proj` **`+1.64 dB`**, `mlp.gate_proj` **`+1.52 dB`**, `mlp.down_proj` **`+0.86 dB`** (`+1.22 WT2 / +0.50 Code` at `damp=0.35`).
+- **Empirical `n >> K` overfitting curve on `mlp.down_proj` (`K=17,408`):**
+  - `L3.down_proj`: `16K` = `-2.12 dB` -> `65K` = `-0.79 dB` -> `261K (d=0.01)` = `+0.53 dB` -> `261K (d=0.05)` = `+0.78 dB` -> `261K (d=0.20)` = `+1.11 dB` -> **`261K (d=0.35)` = `+1.19 dB`**.
+  - `L40.down_proj`: `16K` = `-2.47 dB` -> `65K` = `-0.22 dB` -> `261K (d=0.01)` = `+0.48 dB` -> `261K (d=0.05)` = `+0.69 dB` -> **`261K (d=0.35)` = `+0.86 dB`**.
+- **Per-Projection Marchenko–Pastur Shrinkage Damping Rule (do NOT use one global `damp=0.01`):**
+  - Dense RMSNorm-fed attention inputs (`q/k/v/o`, `in_proj_qkv/z/a/b`, `out_proj`, `K=5120–6144`): **`damp = 0.05`** (preserves `+2.2` to `+5.45 dB` without deep-layer overfitting).
+  - `mlp.gate_proj` / `up_proj` (`K=5120`): **`damp = 0.10`** (`+1.50` to `+2.14 dB`).
+  - Sparse-SwiGLU `mlp.down_proj` (`K=17,408`, lower effective active-neuron sample count): **`damp = 0.35`** (`+0.3` to `+0.66 dB` better held-out than `damp=0.01`!).
+- **Un-normalized SwiGLU Hessian energy imbalance (`[MEASURED]`):** After RMSNorm (`attn_in`, `attn_out`), `tr(H_prose) / tr(H_code)` is `0.92–1.01`, but directly after un-normalized SwiGLU (`mlp.down_proj`), `tr_prose / tr_code` swings from **`2.86x`** at `L3` (silently weighting unweighted `H` 74% prose / 26% code; trace-balancing boosted L3 Code by `+0.39 dB`) to **`0.75x`** at `L40`. Always audit domain Hessian trace ratios on mixed calibration corpora.
+- **Three confirmed V1-GPTQ implementation invariants:**
+  1. **Uncentered GPTQ absorbs `BiasCorr`:** across all 17 tested projections, adding post-GPTQ `BiasCorr` changed held-out SNR by **`0.00 to +0.01 dB`**.
+  2. **`d_row` from RTN strictly beats unclipped `amax/112`:** across all 17 projections, keeping RTN's `d_row` beat `amax/112` by **`+0.07 to +0.10 dB`** with saturation fraction `< 0.0008`.
+  3. **Xe2 Hybrid CPU/XPU GPTQ Execution:** accumulate `H = X_rot^T X_rot` on XPU in FP32 (flushing every 8 mini-batches to CPU FP64), compute `torch.linalg.cholesky` **once per shared input group** in CPU FP64 (`1.1 s` for `K=5120`, `31.3 s` for `K=17,408` — XPU falls back to CPU anyway), then run the `bs=128` GPTQ block update on XPU in FP32 (`< 2 s`). Only **4 Choleskys/layer** cover all 7–8 decoder linears (`~53 min` for full 64-layer sequential closed-loop 27B conversion).
+
 #### Master Decision Ranking: Weights/Converter vs. vLLM/Kernel Upgrades (All Inside V1)
 
 | Domain | Rank | Change | Status & Expected Impact | Pass / Kill Gate |
