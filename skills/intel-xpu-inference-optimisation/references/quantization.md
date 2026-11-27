@@ -148,13 +148,31 @@ Measured on GPU1 (`Qwen3.8-27B` BF16 streamed across `L0..L40`, exact `xe2_dpas_
   2. **`d_row` from RTN strictly beats unclipped `amax/112`:** across all 17 projections, keeping RTN's `d_row` beat `amax/112` by **`+0.07 to +0.10 dB`** with saturation fraction `< 0.0008`.
   3. **Xe2 Hybrid CPU/XPU GPTQ Execution:** accumulate `H = X_rot^T X_rot` on XPU in FP32 (flushing every 8 mini-batches to CPU FP64), compute `torch.linalg.cholesky` **once per shared input group** in CPU FP64 (`1.1 s` for `K=5120`, `31.3 s` for `K=17,408` — XPU falls back to CPU anyway), then run the `bs=128` GPTQ block update on XPU in FP32 (`< 2 s`). Only **4 Choleskys/layer** cover all 7–8 decoder linears (`~53 min` for full 64-layer sequential closed-loop 27B conversion).
 
+#### Full 64-Layer Closed-Loop True-Causal Breakthrough (`Exp 19-Full`, v3.12.0 — ZERO Format/Kernel Change)
+Quantizing all **496 decoder linears** of `Qwen3.8-27B` sequentially (closed-loop quantized calibration inputs, `261,632` pos0-excluded tokens across 256 WT2-train + 256 full-alphabet Python stdlib sequences with `0/0` 6-gram eval overlap, `d_row` from RTN, per-projection shrinkage `0.05 / 0.10 / 0.35`, `max_abs == 0.0` V1 pack/unpack parity on all 496 modules; `90.4 min`, `331.7 kJ` on 1× B70) and scoring on the exact `Exp 15A` 64-layer true-causal `2 × 2,044`-token WT2/Code harness (`max_abs_diff == 0.0` against BF16 cache):
+
+| 64-Layer True-Causal Arm | WT2 KL | WT2 PPL | WT2 Top-1 | Code KL | Code PPL | Code Top-1 | Notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `BF16_reference` | `0.000000` | `7.798` | `100.00%` | `0.000000` | `2.374` | `100.00%` | Exact frozen cache parity (`0.0`) |
+| `shipped_HF_G16_W4A16_BC` (`RTN+BC`, `496` mods) | `0.027078` | `7.947` | `94.32%` | `0.128974` | `2.541` | `91.73%` | Shipped V1 baseline (`4.260 bpw`) |
+| `shipped_HF_G16_W4A8_BC` (`RTN+BC`, `496` mods) | `0.027611` | `7.942` | `94.47%` | `0.134799` | `2.555` | `91.68%` | Shipped V1 live INT8 DPAS |
+| `TFQ3-4b matched400 DF` (trellis, Exp 15A) | `0.025285` | — | — | `0.110420` | — | — | 400 mods, Viterbi trellis |
+| `TFQ3-4b matched400 +BC` (trellis+BC, Exp 15A) | `0.018522` | — | — | `0.088788` | — | — | 400 mods + BiasCorr |
+| **`V1_GPTQ_W4A16_DF` (exact V1, ZERO BiasCorr!)** | **`0.016430`** | **`7.891`** | **`95.01%`** | **`0.089716`** | **`2.515`** | **`93.10%`** | **`-39.32%` WT2 / `-30.44%` Code KL** (`p=1.00000`, `4.255 bpw`) |
+| **`V1_GPTQ_W4A8_DF` (exact V1, INT8 DPAS!)** | **`0.017249`** | **`7.879`** | **`94.96%`** | **`0.094046`** | **`2.517`** | **`93.05%`** | **`-37.53%` WT2 / `-30.23%` Code KL** (`p=1.00000`) |
+| `V1_GPTQ_W4A16_plusBC` / `_minusBC` (control) | `0.016412` / `0.016225` | `7.892` | `95.16%` | `0.089672` / `0.089544` | `2.521` | `93.30%` | **4-check BC gate FAILS (`p=0.59/0.52`, `-BC` ties `+BC`) — drop BC!** |
+
+- **Landmark result (`[MEASURED-RECEIPT]`):** A pure-scalar, DPAS-native V1 checkpoint (`xe2_dpas_native_v1`, zero runtime overhead, zero format/kernel changes) with closed-loop Full-$H$ uncentered GPTQ **beats TensorFold's Viterbi-trellis `TFQ3-4b` DF by `-35.0%` WT2 KL and `-18.8%` Code KL**, and even **beats `TFQ3-4b + BiasCorr` on WT2 KL (`0.01643` vs `0.01852`, `-11.3%`)** while tying on Code (`0.0897` vs `0.0888`) despite quantizing 96 more tensors.
+- **Paired 32-token within-window block bootstrap (`10,000` draws):** `V1_GPTQ_W4A16_DF - shipped_HF_G16_W4A16_BC` = **`-0.010648` WT2** (95% CI `[-0.01458, -0.00718]`, `p = 1.00000`) and **`-0.039258` Code** (95% CI `[-0.05002, -0.02937]`, `p = 1.00000`).
+- **4-Check `BiasCorr` Gate Post-GPTQ:** `V1_GPTQ_W4A16_plusBC - DF` is statistically null (`-0.000018` WT2 `p=0.587`, `-0.000044` Code `p=0.516`) and the sign-flip negative control `-BC` (`0.016225 / 0.089544`) is indistinguishable. **Rule:** omit `bias_corr` on uncentered V1-GPTQ checkpoints (saves `14.9 MiB` and keeps the epilogue branch-free).
+
 #### Master Decision Ranking: Weights/Converter vs. vLLM/Kernel Upgrades (All Inside V1)
 
 | Domain | Rank | Change | Status & Expected Impact | Pass / Kill Gate |
 |---|---:|---|---|---|
 | **vLLM / Kernel** | **1** | **Dual-zebin GRF split:** compile decode/sk4/actq at **128 GRF**, tall prefill at **256 GRF** | `[HYPOTHESIS]` **`+1.0 tok/s` (`C=1`), `+1.0–1.5 tok/s/req` (`C=4/8`)**; fixes 1.25-wave EU stall on `N=5120` | **Bit-exact** greedy SHA-256; check `m4` spill report |
 | **vLLM / Kernel** | **2** | **Small-M DPAS decode (`M=1..32` W4A16-on-DPAS or Digit-DPAS) + real `m3` + bisect `exp8a` `M=4` regression** | `[HYPOTHESIS]` **`C=4`: `+45–50%` (`20 -> ~29–30 tok/s/req`)**, **`C=8`: `+22–26%` (`21.4 -> ~26–27`)**, halves `M=3`, kills `M=4->5` precision cliff, unlocks **MTP** | Flat `M=1..32` curve + full KL & exact-answer parity gate (`DNR-009`) |
-| **Weights / Converter** | **3** | **Full-$H$ Uncentered GPTQ into V1 (`>= 256K` cal tokens, pinned corpus)** | `[MEASURED]` `+3.4–4.3 dB` L0 SNR; `[HYPOTHESIS]` **`-25% to -45%` 64L KL** (0 runtime cost) | Pilot `L3/L40 down_proj` `>= +1.0 dB` held-out; 64L DF KL `<= 0.0253` WT2 / `<= 0.1104` Code; kill if `< 10%` KL win |
+| **Weights / Converter** | **3 (DONE — SHIPPED RECEIPT)** | **Full-$H$ Uncentered GPTQ into V1 (`261K` full-alpha corpus, `0.05/0.10/0.35` shrinkage, closed-loop)** | `[MEASURED-RECEIPT]` **64L WT2 KL `-39.32%` (`0.0271 -> 0.01643`), Code KL `-30.44%` (`0.1290 -> 0.08972`)**, `p=1.00000`, **beats TFQ3-4b DF by `-35% / -19%`**, 0 runtime cost, drops `BiasCorr` (`4.255 bpw`) | **PASSED ALL GATES** (`0.0` V1 pack parity on 496/496 modules; `-BC` null confirmed) |
 | **vLLM / Kernel** | **4** | **Fix `v0.2.0` default `w4a16 -> Triton` fallback at `M>=5`, log all fallbacks, fix false `K<=17408` guard** | `[SOURCE-VERIFIED]` Hygiene bugfixes preventing silent multi-× slowdowns | Zero silent Triton fallbacks under `HF_INT4_G16_BACKEND=native` |
 | **vLLM / Kernel** | **5** | **Single-pass in-register `actq` (`+2%` prefill) + `A8` pre-expanded int8 prefill diagnostic (`16x` A-tile re-read)** | `[HYPOTHESIS]` Up to **`+28–30%` prefill (`1.28x -> ~1.7–1.8x` vs GPTQ)** if A-tile re-reads are the limiter | If pre-expanded int8 hits `>= 250 TOPS`, fix unpack; if `~170 TOPS`, add SLM-shared A / 32-col tile |
 | **Weights (V3 opt.)** | **6** | **2D int8 LUT `T[u][q]` (`256 B/tensor`)** or **per-projection `BiasCorr` shrinkage** | `[MEASURED]` `+0.30 dB` (`T[u][q]`) or `-2% to -4%` KL (shrinkage — only if GPTQ is not adopted) | Kill `T[u][q]` if `M=1` decode regresses `> 2%` or KL win `< 3%` |
